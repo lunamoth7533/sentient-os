@@ -5,7 +5,7 @@
 //  Reads a user folder. Recurses subfolders, keeps only whitelisted extensions,
 //  and extracts a BOUNDED amount of content per type:
 //   • pdf              → first 3 pages of text (PDFKit)
-//   • doc / docx       → text (NSAttributedString, best-effort; legacy .doc may be empty)
+//   • doc / docx       → text (NSAttributedString; read/decode failures remain queued)
 //   • md / txt         → text (char-capped)
 //   • png/jpg/jpeg/heic → downsized JPEG (~720p) for the vision model (never decodes full 4K)
 //
@@ -104,6 +104,7 @@ struct FilesSource: Sendable {
     /// hidden dirs are already excluded by the enumerator options; this prunes at the parent.
     /// Internal (not private) so the skipping self-test's census can report reasons.
     static func pruneReason(_ dir: URL) -> String? {
+        if StructuredImporter.isGenerated(dir, excluded: [ContextPaths.root]) { return "Sentient generated context" }
         let name = dir.lastPathComponent
         if name.hasSuffix(".noindex") { return "noindex" }
         if skipDirNames.contains(name.lowercased()) { return "dep/build/dataset dir name" }
@@ -223,6 +224,7 @@ struct FilesSource: Sendable {
     /// Returns newest-first; each Candidate's `itemDate` IS its date added (so ItemKey =
     /// (itemDate, path)). Reuse `load(_:)` for content extraction.
     func eligibleFiles() -> [Candidate] {
+        guard !StructuredImporter.isGenerated(root, excluded: [ContextPaths.root]) else { return [] }
         let now = Date()
         let rootDepth = root.pathComponents.count
         let keys: Set<URLResourceKey> = [.isRegularFileKey, .isDirectoryKey, .isSymbolicLinkKey,
@@ -308,6 +310,7 @@ struct FilesSource: Sendable {
     static func loadArtifact(_ candidate: Candidate) throws -> Artifact {
         guard let path = candidate.metadata["path"] else { throw FilesError.noPath }
         let url = URL(fileURLWithPath: path)
+        guard !StructuredImporter.isGenerated(url, excluded: [ContextPaths.root]) else { throw FilesError.generatedContext }
         let ext = url.pathExtension.lowercased()
         if imageExtensions.contains(ext) {
             return Artifact(candidate: candidate, imageData: try downsampledJPEG(url))
@@ -320,32 +323,47 @@ struct FilesSource: Sendable {
     private static func extractText(url: URL, ext: String) throws -> String {
         let raw: String
         switch ext {
-        case "pdf":          raw = pdfText(url)
-        case "doc", "docx":  raw = wordText(url)
-        default:             raw = plainText(url)   // md, txt
+        case "pdf":          raw = try pdfText(url)
+        case "doc", "docx":  raw = try wordText(url)
+        default:             raw = try plainText(url)   // md, txt
         }
+        // Copies outside Sentient's generated folders remain generated context. Check before the
+        // excerpt cap so moving the marker later in a copied document cannot send it back to triage.
+        guard !raw.contains(ContextProjection.marker) else { throw FilesError.generatedContext }
         let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
         return String(trimmed.prefix(maxContentChars))
     }
 
-    private static func pdfText(_ url: URL) -> String {
-        guard let doc = PDFDocument(url: url) else { return "" }
+    private static func pdfText(_ url: URL) throws -> String {
+        guard let doc = PDFDocument(url: url) else { throw FilesError.pdfDecodeFailed }
+        guard !doc.isLocked else { throw FilesError.pdfLocked }
         var out = ""
         for i in 0..<min(pdfPageLimit, doc.pageCount) {
-            if let s = doc.page(at: i)?.string { out += s + "\n" }
+            guard let page = doc.page(at: i) else { throw FilesError.pdfDecodeFailed }
+            if let s = page.string { out += s + "\n" }
             if out.count >= maxContentChars { break }
         }
         return out
     }
 
-    private static func wordText(_ url: URL) -> String {
-        // Auto-detects docx/doc/rtf by content; best-effort (legacy binary .doc may return "").
-        (try? NSAttributedString(url: url, options: [:], documentAttributes: nil))?.string ?? ""
+    private static func wordText(_ url: URL) throws -> String {
+        // Auto-detects docx/doc/rtf by content. A valid empty document is still an empty string;
+        // read or decoding failures throw so the ingestion checkpoint cannot consume them as junk.
+        var attributes: NSDictionary?
+        let decoded = try NSAttributedString(url: url, options: [:], documentAttributes: &attributes)
+        // AppKit can "succeed" on corrupt .doc bytes by interpreting them as Latin-1 plain text.
+        // Require a recognized document format, while retaining its supported rich-format detection.
+        guard let format = attributes?[NSAttributedString.DocumentAttributeKey.documentType.rawValue] as? String,
+              format != NSAttributedString.DocumentType.plain.rawValue else { throw FilesError.wordDecodeFailed }
+        return decoded.string
     }
 
-    private static func plainText(_ url: URL) -> String {
-        (try? String(contentsOf: url, encoding: .utf8))
-            ?? (try? String(contentsOf: url, encoding: .isoLatin1)) ?? ""
+    private static func plainText(_ url: URL) throws -> String {
+        let data = try Data(contentsOf: url)
+        guard let text = String(data: data, encoding: .utf8) ?? String(data: data, encoding: .isoLatin1) else {
+            throw FilesError.textDecodeFailed
+        }
+        return text
     }
 
     // MARK: Image downsample (ImageIO thumbnail → ~720p JPEG, no full-res decode)
@@ -389,7 +407,7 @@ struct FilesSource: Sendable {
     }()
     private static func dateString(_ d: Date) -> String { dateFormatter.string(from: d) }
 
-    enum FilesError: Error { case noPath, imageDecodeFailed, imageEncodeFailed }
+    enum FilesError: Error { case noPath, imageDecodeFailed, imageEncodeFailed, pdfDecodeFailed, pdfLocked, wordDecodeFailed, textDecodeFailed, generatedContext }
 }
 
 // MARK: - FileRoot (which folders the Files pipeline can run over)

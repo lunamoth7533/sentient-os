@@ -1,0 +1,46 @@
+# Structured context implementation plan
+
+**Goal:** Import verified model sessions and personal-data exports into local, attributable knowledge that the app and connected models can inspect and retrieve.
+
+**Architecture:** Keep the existing Swift/macOS app and its legacy Sources → Connector → IterativeRun → CycleStore → VaultCloud → markdown vault → mirror/graph path. Add a separate versioned SQLite evidence store for explicitly selected structured sources. Records, document fingerprints, and updates commit together; summaries, graph connections, and context are derived from the current records rather than recursively summarized claims. New sources default to local storage with sharing disabled.
+
+**Tech stack:** Swift, Foundation, SQLite3, CryptoKit, SwiftUI; the existing Xcode app and a dependency-free Swift behavioral harness compiling the same core files.
+
+**Constraints:** Preserve existing stores and source-selection keys. No live patient fixtures. No credentials or private transcript content in tests/logs. Imported instructions are data. Explicit source exclusion differs from stopping collection and from deletion. No cloud analysis or mirror inclusion of new data without a source sharing grant. No private live Lattice database reads.
+
+## Assessment and baseline
+
+- Clean checkout on `main`; work branch `codex/structured-context`.
+- Xcode baseline Debug app build succeeded with signing disabled, using the direct Xcode executable. `/usr/bin/xcrun` wrappers fail with arm64/arm64e mismatch; direct toolchain works. First sandboxed package-resolution attempt failed; unsandboxed retry succeeded.
+- The documented temporary self-test directory is empty. User explicitly requests durable regression coverage, so new tests will be retained outside that Release-stripped directory.
+- Confirmed code defects: IterativeRun advances over extraction/generation failures; CycleStore swallows terminal save failures and destructively deletes its store on open failure; imported summaries are insert-only; KnowledgeVault's title dictionary silently overwrites ambiguous titles; SQLiteReader does not check terminal step errors, and sequential DB/WAL copying is not a coherent live snapshot.
+- MCP mirror currently exposes a vault tree/README and whole-file reads. Sidekick tells models to search files directly. There is no filtered, budgeted retrieval endpoint.
+
+## Work and verification
+
+- [x] Freeze synthetic evaluation fixtures and queries before retrieval/summarization changes: session continuation, cross-session decisions, conflict, project isolation, Lattice context. Budget 1,024 conservative tokens; record exact baseline outputs and timing. Baseline is the actual legacy title/file consumption policy over the same fixture corpus, not an invented model response.
+- [x] Add normalized records and SQLite transactions with stable identities, document ownership, checkpoints, source controls, secret filtering, and read-only snapshots. Test repeat/restart, changed and deleted records, interrupted input, rollback, rotation, source isolation, and bounded input.
+- [x] Implement verified session adapters (Codex, Claude Code, Hermes, OpenClaw). Preserve roles, provenance, source metadata, tools, lineage, and compaction. Reject unsupported versions with actionable errors. Audit independent producer contracts before implementing them.
+- [x] Implement Lattice Workbench export import and verified personal-data interchange, plus Markdown/CSV imports. Document exact native-producer availability and blockers separately from Sentient's import capability.
+- [x] Implement extractive, attributed summaries and lexical retrieval with project/source/time filters, deterministic deduplication, role-aware ranking, conflicts and omissions, citations, and strict context budgeting. Compare identical queries/budget with baseline before considering semantic infrastructure.
+- [x] Integrate source selection, import/retry/cancel/status, exclusion and removal into Settings. Expose retrieval through the app and a local stdio MCP mode. Feed permitted context to the real model path and consented projections to the existing encrypted mirror. Make current supporting evidence inspectable.
+- [x] Fix legacy persistence/retry and graph resolution defects with behavioral regressions; preserve legacy data on open/migration failures.
+- [x] Build Debug and Release; run retained behavioral tests, fixed evaluation, real installed-format structural smoke tests without storing/sharing live content, and isolated app UI/MCP flows. Review substantive findings and rerun affected checks.
+
+## Progress
+
+2026-09-06: Source/dataflow grounding and baseline build complete. Independent read-only audits of Lattice and installed session producers running. No live data or configuration changed.
+
+2026-09-06 continuation: Structured Codex/Claude/Hermes/OpenClaw adapters implemented against verified native producer formats (13 focused tests and count-only installed-store smoke). Lattice capsule/explicit personal snapshot and metrics CSV adapters pass 12 tests. Native metrics export UI is unavailable in Lattice; compatibility copies are explicitly documented. Baseline fixed corpus/5 queries recorded in `docs/context-baseline.json` before retrieval changes.
+
+Core source store, transactional checkpoints, secret rejection, deterministic projections, filtered retrieval, stdio MCP and CLI are implemented. Settings, source controls/search/inspector, independent context window, command context and graph are wired. Integrated Debug build passed; shared core reached 49/49 tests before added review regressions. The legacy ingestion harness passed 15 cases and graph harness passed 13 (root final reruns pending). Current evaluation finds all required evidence within the frozen 1024-byte budget; final report still pending.
+
+Independent review reproduced quoted-secret/path leakage and multi-copy provenance defects. Privacy fixes are under verification. New evidence schema v2 retains per-owner payloads; v1 migration preserves current payloads and invalidates checkpoints that need reparse. Synthetic upgrade/rollback/config-change tests added. Mirror/archive and processing/cancellation tail integration are in progress. Remaining gates: finish boundary review, retained controller/scheduler/proactive tests, fresh full suite and Debug/Release builds, isolated actual app Sources/Search/graph and CLI/MCP flows, final fixed evaluation and handoff documentation. Production data, cloud mirrors, and Lattice source storage have not been modified.
+
+2026-09-06 final verification pass: independent mirror review closed after retained RED/GREEN cases for credential-unavailable revocation and repeated rotation losing deletion identities. Mirror 26/26, legacy 17/17, graph 13/13, files 16/16, and pipeline 25 behavior groups pass on synthetic stores. Core reached 74 XCTest cases; project overviews now include cited cross-session evidence and sort real timestamp instants. Fixed retrieval still has 9/9 required support, 90% strict required-set precision and 100% fixture citation ID accuracy. The final timing harness uses actual SQLite reads with frozen queries; the corpus/old baseline remain unchanged.
+
+Actual isolated UI verified adding/importing a native-shaped Lattice capsule, evidence search and citation details, exclusion/re-inclusion removing/restoring graph records, and shared-query access only while the synthetic source sharing flag was enabled. Actual app subprocess tests cover imports, retry, deletion and MCP. Remaining final gates: command screenshot/permission/cancellation review and tests, fresh sequential Debug/Release builds, rerun the expanded real-app MCP flow and final generated-note UI check, then complete the handoff. No live source stores, credentials, cloud models or mirrors changed.
+
+2026-09-06 completion: independent command/capture/status and graph/fixture review closed with no remaining serious findings. Final retained checks pass: 75 core XCTest, 17 legacy, 19 graph (also under app actor-isolation flags), 26 mirror, 79 pipeline behavior groups and 16 extraction cases. Graph refresh now follows each vault scan revision; actual exclusion/restoration changed 7→4→7 notes without restart. Generated notes are read-only, paused collection preserves saved context, and the isolated reader cannot activate the production mirror. The copied runtime dylib is now an explicit thinning-script input, fixing the reproduced Xcode copy race.
+
+Fresh final Debug and Release builds passed sequentially with signing disabled. Both actual app executables passed all 8 import/recovery/privacy/MCP flows. The fresh Debug executable passed 6 roundtrip checks against the unchanged native Lattice capsule producer/codec. The relaunched isolated UI showed the expected seven graph notes. Fixed evaluation remains 9/9 required evidence, 90% strict required-set precision and 100% citation ID accuracy; median SQLite-backed retrieval was 0.856 ms on the small frozen corpus. No downstream model-answer or live-cloud improvement is claimed. `git diff --check` passed. Full handoff, exact native-source limitations, privacy/migration implications and reproduction are in `docs/VERIFICATION.md`; no production data, credentials or cloud settings changed and nothing was committed, pushed or deployed.

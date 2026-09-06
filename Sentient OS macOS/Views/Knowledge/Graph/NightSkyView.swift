@@ -60,10 +60,9 @@ struct NightSkyView: View {
             .animation(.easeOut(duration: 0.16), value: model.hoverInfo)
         }
         .background(Theme.bg)
-        // Reruns on every sky entry (silent refresh) AND when the vault first arrives — with the
-        // Constellation View as the window's default, this view mounts before the async vault
-        // scan finishes, so the graph must build the moment the vault lands.
-        .task(id: vault?.root) { await model.load(vault: vault) }
+        // A fresh scan may add the asynchronously prepared projection or edit existing links
+        // under the same root. Refresh for each snapshot, including the first scan's arrival.
+        .task(id: vault?.revision) { await model.load(vault: vault) }
     }
 
     // MARK: HUD (whispers — none of it intercepts the cursor)

@@ -128,6 +128,8 @@ struct ProcessingView: View {
     @State private var started = false
     @State private var paused = false           // pausable only: frozen at the last item, awaiting Resume
     @State private var runTask: Task<RunProgress, Never>?
+    @State private var cycleTask: Task<CycleFailure?, Never>?
+    @State private var importingContext = false
     /// Generation token — pause/stop/disappear bump it, making the (cancelled, still-draining)
     /// run() invocation STALE: it may finish whenever it likes, but it can no longer touch the
     /// UI or fall into the proactive tail. `paused` alone couldn't guarantee that: a quick
@@ -167,7 +169,7 @@ struct ProcessingView: View {
             .frame(maxWidth: .infinity, maxHeight: .infinity)
         }
         .task { await startIfNeeded() }
-        .onDisappear { runGeneration += 1; runTask?.cancel() }   // stale: no tail after the view is gone
+        .onDisappear { runGeneration += 1; runTask?.cancel(); cycleTask?.cancel() }
     }
 
     // MARK: States
@@ -178,12 +180,13 @@ struct ProcessingView: View {
         runGmail && !runCalendar ? "Connecting to Gmail"
             : (runCalendar && !runGmail ? "Connecting to Calendar" : "Connecting to the cloud")
     }
+    private var hasLegacySources: Bool { !connectors.isEmpty || runGmail || runCalendar }
 
     private var loadingView: some View {
         VStack(spacing: 22) {
-            Image(systemName: connectors.isEmpty ? cloudIcon : "cpu").font(.system(size: 46))
+            Image(systemName: importingContext ? "tray.and.arrow.down" : (connectors.isEmpty ? cloudIcon : "cpu")).font(.system(size: 46))
                 .foregroundStyle(.white.opacity(0.6)).symbolEffect(.pulse)
-            Text(connectors.isEmpty ? cloudLabel : "Loading on-device model")
+            Text(importingContext ? "Importing local context" : (connectors.isEmpty ? cloudLabel : "Loading on-device model"))
                 .font(.title3.weight(.semibold)).foregroundStyle(.white)
             ProgressView().tint(.white.opacity(0.4))
         }
@@ -452,8 +455,9 @@ struct ProcessingView: View {
             Image(systemName: "checkmark.circle.fill").font(.system(size: 58))
                 .foregroundStyle(Theme.verdictColor(.survivor))
             VStack(spacing: 6) {
-                Text("Analysis complete").display(28).foregroundStyle(.white)
-                Text("\(progress.survivors) kept · \(progress.junk) junk · \(progress.failed) failed")
+                Text(fullCycle && !hasLegacySources ? "Import complete" : "Analysis complete").display(28).foregroundStyle(.white)
+                Text(fullCycle && !hasLegacySources ? "Imported sources are ready for local context search."
+                     : "\(progress.survivors) kept · \(progress.junk) junk · \(progress.failed) failed")
                     .font(.subheadline).foregroundStyle(.white.opacity(0.55))
             }
             Button(action: onDone) {
@@ -580,6 +584,7 @@ struct ProcessingView: View {
     private func stop() {
         runGeneration += 1
         runTask?.cancel()
+        cycleTask?.cancel()
         onDone()
     }
 
@@ -672,36 +677,61 @@ struct ProcessingView: View {
         let task = Task<RunProgress, Never> {
             defer { continuation.finish() }
             var p = RunProgress()
+            if fullCycle {
+                importingContext = true
+                let imported = await ContextLibrary.shared.importEnabled()
+                if generation == runGeneration { importingContext = false }
+                guard imported else {
+                    p.cancelled = Task.isCancelled
+                    p.failed = 1
+                    p.errorMessage = ContextLibrary.shared.lastError ?? "Local context import did not complete. Retry from Imported Sources."
+                    return p
+                }
+            }
+            guard !Task.isCancelled else { p.cancelled = true; return p }
             if !connectors.isEmpty {
                 p = await IterativeRun(modelPath: modelPath).run(connectors, mode: mode) { continuation.yield($0) }
             }
+            guard !Task.isCancelled, !p.cancelled, p.errorMessage == nil, p.failed == 0 else { return p }
             if runGmail {
                 p = await runGmailLeg(base: p) { continuation.yield($0) }
             }
+            guard !Task.isCancelled, !p.cancelled, p.errorMessage == nil, p.failed == 0 else { return p }
             if runCalendar {
                 p = await runCalendarLeg(base: p) { continuation.yield($0) }
             }
             return p
         }
         runTask = task
-        for await p in stream {
-            guard generation == runGeneration else { continue }   // stale: drain silently, freeze the card
-            if state == .loadingModel { withAnimation { state = .processing } }
-            progress = Self.composed(carried, p)
-        }
-        let final = await task.value
+        let final = await withTaskCancellationHandler {
+            for await p in stream {
+                guard generation == runGeneration else { continue }
+                if state == .loadingModel { withAnimation { state = .processing } }
+                progress = Self.composed(carried, p)
+            }
+            return await task.value
+        } onCancel: { task.cancel() }
         // Paused, stopped, or superseded by a resume: this invocation is stale — the proactive
         // tail (knowledge base + cycle) must ONLY ever run at the end of a live, complete read.
         guard generation == runGeneration else { return }
         progress = Self.composed(carried, final)   // completion shows the whole session's counts
+        guard !Task.isCancelled, !task.isCancelled, !final.cancelled else {
+            withAnimation { state = .failed(CycleFailure(message: "Analysis cancelled. Saved progress remains available for retry.", kind: nil)) }
+            return
+        }
+        if final.errorMessage != nil || final.failed > 0 {
+            withAnimation { state = .failed(CycleFailure(message: final.errorMessage ?? "Some items could not be analyzed. Retry to finish the remaining work.", kind: nil)) }
+            return
+        }
 
         // Real-mode Analyze Now: after the read, file into the knowledge base + run all three proactive
         // steps + wipe the summaries — surfacing each phase — then reveal the real cards on the home.
-        if fullCycle {
+        if fullCycle && hasLegacySources {
             withAnimation { state = .preparing }
             thoughtPending = nil; thoughtTrail = []
-            let failure = await ProactiveCycle.shared.run(progress: { phase in
+            let tail = Task { await ProactiveCycle.shared.run(progress: { phase in
                 Task { @MainActor in
+                    guard generation == runGeneration else { return }
                     thoughtPending = nil; thoughtTrail = []          // a new phase, a fresh thought stream
                     switch phase {
                     case .knowledgeBase(let s):
@@ -718,9 +748,15 @@ struct ProcessingView: View {
                 }
             }, onLine: { line in
                 Task { @MainActor in
+                    guard generation == runGeneration else { return }
                     if let t = Self.thought(line) { thoughtPending = t }
                 }
-            })
+            }) }
+            cycleTask = tail
+            let failure = await withTaskCancellationHandler { await tail.value } onCancel: { tail.cancel() }
+            guard generation == runGeneration else { return }
+            cycleTask = nil
+            guard !Task.isCancelled, !tail.isCancelled else { return }
             if let failure { withAnimation { state = .failed(failure) }; return }
         }
         withAnimation { state = .completed }
@@ -767,9 +803,12 @@ struct ProcessingView: View {
                                  : try await GmailConnect.runIterative(onProgress: onProgress)
         } catch {
             var p = box.value
+            p.cancelled = Task.isCancelled || error is CancellationError
+            p.failed += 1
+            p.errorMessage = p.errorMessage ?? (p.cancelled ? "Gmail analysis was cancelled. Saved windows remain available for retry." : "Gmail: \(error.localizedDescription)")
             p.lastTitle = "Gmail failed"
-            p.lastSummary = (error as? LocalizedError)?.errorDescription ?? "\(error)"
-            p.lastVerdict = .junk
+            p.lastSummary = p.errorMessage
+            p.lastVerdict = nil
             p.lastFilePath = nil
             box.value = p
             yield(p)
@@ -817,9 +856,12 @@ struct ProcessingView: View {
                                  : try await CalendarConnect.runIterative(onProgress: onProgress)
         } catch {
             var p = box.value
+            p.cancelled = Task.isCancelled || error is CancellationError
+            p.failed += 1
+            p.errorMessage = p.errorMessage ?? (p.cancelled ? "Calendar analysis was cancelled. Saved windows remain available for retry." : "Calendar: \(error.localizedDescription)")
             p.lastTitle = "Calendar failed"
-            p.lastSummary = (error as? LocalizedError)?.errorDescription ?? "\(error)"
-            p.lastVerdict = .junk
+            p.lastSummary = p.errorMessage
+            p.lastVerdict = nil
             p.lastFilePath = nil
             box.value = p
             yield(p)
@@ -923,4 +965,3 @@ extension ProcessingView {
         .frame(width: 1160, height: 780)
 }
 #endif
-

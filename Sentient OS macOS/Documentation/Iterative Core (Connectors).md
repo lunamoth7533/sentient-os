@@ -30,7 +30,11 @@ A connector is dumb: it lists keyed work-items per bucket and loads one. *All* p
   survivor, wiped each cycle; carries `kind`+`sourceID` for the cloud's trust tag). The crash-safe write
   path is `advance` (everyday: note + mark in ONE save) / `sinkFloor` (first run: note + floor in ONE
   save) / `collapseFloor`; plus `pointer`/`pointerState`/`connectorMarks`/`setPointer`/`clearBucket` ·
-  `recordNote`/`notes`/`wipeAllNotes`/`wipeEverything`/`importNotes` · `counts`.
+  `recordNote`/`notes`/`readNotes`/`wipeNotesDurably(matching:)`/`wipeAllNotesDurably`/`wipeAllNotes`/`wipeEverything`/`importNotes` · `counts`.
+  Progress writes throw after rollback and one retry. Unreadable shared storage is preserved and
+  disabled, with `requireAvailable()` exposing recovery guidance. Imports merge the same bucket,
+  kind, source ID and item date without adding schema fields; strict `readNotes()` is used before
+  replacement backups so a failed fetch cannot look like an empty set.
 - **`IterativeRun`** (`Ingestion/IterativeRun.swift`) — drives any connector, three modes, and is
   **crash-safe**: every processed item commits its optional survivor note AND its progress marker in ONE
   atomic store write — no gap for a crash to land in, so a run never duplicates or skips. **initial**
@@ -44,7 +48,10 @@ A connector is dumb: it lists keyed work-items per bucket and loads one. *All* p
   the rest up, all in one pass. (Home → `.auto`; the dev INITIAL/ITERATIVE buttons → `.initial`/
   `.iterative`; explicit `.initial` first clears the bucket = a full reset.) Reuses `Engine` + `Triage` +
   the GPU-wedge resilience (preemptive reload every ~40 items + reactive reload after a burst of
-  failures). Survivors → `CycleNote`; junk/sensitive store nothing. A deterministic **PII backstop**
+  failures). Extraction, generation, unreadable/incomplete triage, and save failures pause that
+  bucket at its last committed item; other buckets continue. Cancelled work does not commit.
+  `RunProgress.errorMessage` retains an actionable failure even after other buckets succeed.
+  Survivors → `CycleNote`; genuine junk/sensitive verdicts advance without a note. A deterministic **PII backstop**
 (`Engine/PIIScan.swift`) runs on every would-be survivor's summary + title — a US SSN, a Luhn-valid
 credit-card number, or a passport number drops the whole item as `.sensitive` (zero trace), so a
 small on-device model slipping a raw identifier past the prompt can never send it to the cloud.
@@ -52,10 +59,12 @@ small on-device model slipping a raw identifier past the prompt can never send i
 ## The cycle (summaries are disposable)
 *on-device summarize → cloud (make/update KB) → cloud (proactive judge) → next cycle.*
 `CycleNote`s are ephemeral, so "tell cloud" just sends whatever exists (no "which are new?"
-bookkeeping). Only the per-bucket mark persists. `CycleStore.wipeAllNotes()` is the cycle-end wipe,
+bookkeeping). Only the per-bucket mark persists. `CycleStore.wipeNotesDurably(matching:)` is the cycle-end cleanup,
 fired by **`ProactiveCycle`** (`Proactive/ProactiveCycle.swift`) as step 4 of the shared post-read
 tail (KB → mirror → proactive → wipe) — and ONLY on a fully successful chain, so a failed step keeps
-the summaries for retry. The dev "proactive system" button stays read-only/re-runnable for prompt
+the summaries for retry. It removes only notes still equal to the strict snapshot consumed by cloud
+work; notes added or revised during an await remain for the next cycle. Cleanup failures throw and
+roll back. The dev "proactive system" button stays read-only/re-runnable for prompt
 tuning; the dev **Reset everything** (→ the shared `FactoryReset`) wipes notes AND pointers.
 
 ## The cloud — `VaultCloud` (`Vault/VaultCloud.swift`)

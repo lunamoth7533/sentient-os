@@ -113,7 +113,8 @@ struct SummariesView: View {
     // MARK: Load / clear
 
     private func load() async {
-        notes = await CycleStore.shared.notes()
+        do { notes = try await CycleStore.shared.readNotes() }
+        catch { status = "✗ \(error.localizedDescription)"; loaded = false; return }
         loaded = true
     }
 
@@ -164,25 +165,28 @@ struct SummariesView: View {
     }
 
     private func performImport(_ exp: SummaryExport) async {
-        let existing = await CycleStore.shared.notes()
-        backup(existing)                                              // safety net before any wipe
-        await CycleStore.shared.importNotes(exp.notes, replace: true)
-        pendingImport = nil
-        await load()
-        status = "✓ imported \(exp.notes.count)" + (existing.isEmpty ? "" : " · backed up \(existing.count)")
+        do {
+            let existing = try await CycleStore.shared.readNotes()
+            try backup(existing)                                      // a failed backup must stop replacement
+            try await CycleStore.shared.importNotes(exp.notes, replace: true)
+            pendingImport = nil
+            await load()
+            status = "✓ imported \(notes.count)" + (existing.isEmpty ? "" : " · backed up \(existing.count)")
+        } catch {
+            status = "✗ Import stopped: \(error.localizedDescription)"
+        }
     }
 
     /// Dump the soon-to-be-replaced notes to SentientOS/SummaryBackups so an accidental import is
     /// always recoverable (re-import the backup to undo).
-    private func backup(_ items: [CycleNoteItem]) {
+    private func backup(_ items: [CycleNoteItem]) throws {
         guard !items.isEmpty else { return }
         let dir = URL.sentientSupport.appending(path: "SummaryBackups", directoryHint: .isDirectory)
-        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
-        let url = dir.appending(path: "backup-\(Self.stamp()).json")
-        if let data = try? Self.encoder.encode(SummaryExport(notes: items)) {
-            try? data.write(to: url)
-            Log("SummariesView: backed up \(items.count) summaries → \(url.path)")
-        }
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        let url = dir.appending(path: "backup-\(Self.stamp())-\(UUID().uuidString).json")
+        let data = try Self.encoder.encode(SummaryExport(notes: items))
+        try data.write(to: url, options: .atomic)
+        Log("SummariesView: backed up \(items.count) summaries")
     }
 
     // MARK: Codec helpers

@@ -1,0 +1,22 @@
+{
+  "budget": 1024,
+  "records": [
+    {"id":"a-decision","project":"/work/atlas","session":"atlas-1","role":"user","kind":"decision","date":"2026-09-01T10:00:00Z","text":"Atlas storage decision: use SQLite WAL. Preserve the existing vault during migration."},
+    {"id":"a-retry","project":"/work/atlas","session":"atlas-2","role":"user","kind":"message","date":"2026-09-03T10:00:00Z","text":"Atlas session continuation: next action is retry recovery. Keep failed records eligible after restart."},
+    {"id":"a-failure","project":"/work/atlas","session":"atlas-2","role":"tool","kind":"tool_result","date":"2026-09-03T10:01:00Z","text":"Atlas retry recovery test failed: checkpoint advanced past an unread record. Exit status 1."},
+    {"id":"a-proposal","project":"/work/atlas","session":"atlas-2","role":"assistant","kind":"message","date":"2026-09-03T10:02:00Z","text":"I propose deleting the old vault to simplify Atlas storage. This has not been approved or executed."},
+    {"id":"a-cross","project":"/work/atlas","session":"atlas-3","role":"user","kind":"decision","date":"2026-09-04T10:00:00Z","text":"Atlas storage: keep the earlier SQLite WAL decision. New imports must stay local unless sharing is enabled."},
+    {"id":"a-friday","project":"/work/atlas","session":"atlas-1","role":"user","kind":"decision","date":"2026-09-01T11:00:00Z","text":"Atlas launch date is Friday."},
+    {"id":"a-monday","project":"/work/atlas","session":"atlas-3","role":"user","kind":"correction","date":"2026-09-04T11:00:00Z","text":"Correction: Atlas launch date is Monday. Friday is superseded."},
+    {"id":"m-pass","project":"/work/mercury","session":"mercury-1","role":"tool","kind":"tool_result","date":"2026-09-05T10:00:00Z","text":"Mercury retry recovery tests passed: 8 checks, exit status 0."},
+    {"id":"l-work","project":"lattice-demo","session":"work-1","role":"summary","kind":"test","date":"2026-09-05T12:00:00Z","text":"Workbench validation: three synthetic capsule checks passed. Source reports success; evidence test:fixture-3."},
+    {"id":"l-steps","project":"lattice-demo","session":"day-1","role":"observation","kind":"metric","date":"2026-09-05T12:30:00Z","text":"Daily steps observation: 0 steps on 2026-09-05. Civil day; timezone unknown. Sleep is missing, not zero."}
+  ],
+  "queries": [
+    {"id":"continuation","query":"Atlas session continuation retry recovery next action","project":"/work/atlas","required":["a-retry","a-failure"],"forbidden":["m-pass"]},
+    {"id":"cross-session","query":"Atlas storage decision SQLite WAL migration","project":"/work/atlas","required":["a-decision","a-cross"],"forbidden":["m-pass"]},
+    {"id":"conflict","query":"Atlas launch date correction Friday Monday","project":"/work/atlas","required":["a-monday","a-friday"],"forbidden":["m-pass"]},
+    {"id":"project-isolation","query":"Mercury retry recovery status","project":"/work/mercury","required":["m-pass"],"forbidden":["a-failure","a-proposal"]},
+    {"id":"lattice","query":"Workbench validation daily steps sleep","project":"lattice-demo","required":["l-work","l-steps"],"forbidden":["a-proposal","m-pass"]}
+  ]
+}

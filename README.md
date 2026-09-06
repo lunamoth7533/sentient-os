@@ -4,6 +4,8 @@
 
 <samp>open source · free · optimized for Apple silicon</samp>
 
+Structured session and personal-export imports are available in Settings → Knowledge Sources. See [Imported Context](docs/IMPORTED_CONTEXT.md) for supported adapters, local privacy controls, MCP setup, and verification commands.
+
 </div>
 
 <br/>

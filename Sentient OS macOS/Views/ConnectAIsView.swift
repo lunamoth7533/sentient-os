@@ -47,6 +47,7 @@ struct ConnectAIsView: View {
     @State private var busy = false
     @State private var confirmOff = false
     @State private var errorLine: String?
+    @State private var removalPending = false
     @State private var copiedLink = false
     @State private var copiedPrompt = false
 
@@ -67,13 +68,16 @@ struct ConnectAIsView: View {
         .overlay(alignment: .topTrailing) {
             if loaded && enabled { sharingPill.padding(16) }
         }
+        .overlay(alignment: .bottom) {
+            if loaded && removalPending { pendingRemovalNotice.padding(24) }
+        }
         .frame(minWidth: 1100, minHeight: 880)
         .task { await refresh() }
         .alert("Stop sharing your knowledge base?", isPresented: $confirmOff) {
             Button("Keep Sharing", role: .cancel) {}
             Button("Stop & Delete Cloud Copy", role: .destructive) { disconnect() }
         } message: {
-            Text("The cloud copy is deleted immediately and your AIs lose access. Your knowledge base stays safe on this Mac, and turning sharing back on restores the same link.")
+            Text("Sharing stops on this Mac immediately, and Sentient requests deletion of the cloud copy. If the server or Keychain is unavailable, the previous cloud copy may remain readable until removal succeeds. Your local knowledge base stays intact, and turning sharing back on restores the same link.")
         }
     }
 
@@ -116,11 +120,11 @@ struct ConnectAIsView: View {
                 VStack(alignment: .leading, spacing: 10) {
                     veilPillar("lock.fill", "Zero-access encryption. Your knowledge base is sealed on this Mac with a key only your Mac and your private link hold; our servers store nothing but ciphertext, with no key beside it. Hack them and there is nothing to unlock.")
                     veilPillar("chevron.left.forwardslash.chevron.right", "The server in between is open source. Everything's verifiable.")
-                    veilPillar("key.fill", "No account. Turn it off anytime and the cloud copy is deleted on the spot.")
+                    veilPillar("key.fill", "No account. Turn sharing off anytime and request deletion of the cloud copy. Pending removal stays visible until it succeeds.")
                 }
                 .frame(width: 440)
                 .padding(.top, 28)
-                GlowButton(title: busy ? "Connecting…" : "Yes, use the cloud MCP",
+                GlowButton(title: busy ? "Working…" : "Yes, use the cloud MCP",
                            systemImage: "link", glowIntensity: 0.5) { connect() }
                     .frame(width: 280)
                     .padding(.top, 36)
@@ -409,10 +413,26 @@ struct ConnectAIsView: View {
         return "MCP ON · SYNCED \(pushed.glanceStamp.uppercased())"
     }
 
+    private var pendingRemovalNotice: some View {
+        VStack(spacing: 8) {
+            Text(enabled ? "Remote removal is pending. The previous cloud copy may remain readable." : "Sharing is off on this Mac. The previous cloud copy may remain readable until removal succeeds.")
+                .font(.system(size: 12)).foregroundStyle(Theme.Ink.amber)
+                .multilineTextAlignment(.center)
+            Button("Retry cloud removal") { retryRemoval() }
+                .buttonStyle(.bordered)
+                .disabled(busy)
+        }
+        .padding(14)
+        .frame(maxWidth: 480)
+        .background(Theme.bg, in: RoundedRectangle(cornerRadius: 14))
+        .overlay(RoundedRectangle(cornerRadius: 14).strokeBorder(Theme.Ink.amber.opacity(0.35)))
+    }
+
     // MARK: - MirrorClient plumbing (the SAME path Settings + the popover drive)
 
     @MainActor private func refresh() async {
         enabled = await MirrorClient.shared.isEnabled
+        removalPending = MirrorClient.remoteRemovalPending
         shareURL = await MirrorClient.shared.shareURL
         loaded = true
         // Sharing off: EVERY open gets the ritual — land crisp for a second, then draw the veil.
@@ -442,16 +462,30 @@ struct ConnectAIsView: View {
                 errorLine = (error as? LocalizedError)?.errorDescription ?? "\(error)"
             }
             busy = false
+            removalPending = MirrorClient.remoteRemovalPending
         }
     }
 
     private func disconnect() {
         guard !busy else { return }
         busy = true; errorLine = nil
+        // Local opt-out is immediate; the notice stays visible until remote deletion acknowledges.
+        removalPending = true
+        withAnimation(.easeOut(duration: 0.4)) { enabled = false; veiled = true }
         Task { @MainActor in
             await MirrorClient.shared.disable()
-            // The veil returns immediately — no peek; the CTA is the off state's only exit.
-            withAnimation(.easeOut(duration: 0.4)) { enabled = false; veiled = true }
+            removalPending = MirrorClient.remoteRemovalPending
+            busy = false
+        }
+    }
+
+    private func retryRemoval() {
+        guard !busy else { return }
+        busy = true; errorLine = nil
+        Task { @MainActor in
+            do { try await MirrorClient.shared.contextChanged() }
+            catch { errorLine = error.localizedDescription }
+            removalPending = MirrorClient.remoteRemovalPending
             busy = false
         }
     }

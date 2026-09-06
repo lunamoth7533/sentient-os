@@ -84,8 +84,8 @@ final class CycleNote {
 
 /// A Sendable snapshot of one CycleNote — what VIEW SUMMARIES + the cloud calls consume. Codable so
 /// a whole summary set can be exported/imported between devs (computed props below aren't stored).
-struct CycleNoteItem: Codable, Sendable, Identifiable {
-    let id: String             // sourceID (unique within a cycle)
+struct CycleNoteItem: Codable, Sendable, Identifiable, Equatable {
+    let id: String             // bucket + kind + source ID + item date; distinct windows stay distinct
     let bucketKey: String
     let kind: SourceKind
     let sourceID: String
@@ -120,8 +120,8 @@ struct SummaryExport: Codable, Sendable {
 }
 
 /// The survivor fields for one processed item, handed to an atomic per-item commit (note + marker in
-/// ONE save). nil at a call site = a non-survivor (junk / sensitive / failed) — the marker still
-/// advances past it, but no note is kept (zero trace).
+/// ONE save). nil at a call site = a genuine non-survivor (junk / sensitive) — the marker still
+/// advances past it, but no note is kept (zero trace). Failed attempts MUST NOT commit a marker.
 struct NoteDraft: Sendable {
     let kind: SourceKind
     let sourceID: String
@@ -136,6 +136,27 @@ struct NoteDraft: Sendable {
 
 @ModelActor
 actor CycleStore {
+    private var unavailable = false
+
+    enum StoreError: LocalizedError {
+        case unavailable
+        var errorDescription: String? {
+            "Local summary storage is unavailable. Existing data was preserved. Check free disk space and Application Support access, then restart Sentient."
+        }
+    }
+
+    /// A disabled sentinel lets the UI explain an open failure without deleting the user's store
+    /// or quietly treating a fresh in-memory database as writable replacement storage.
+    init(modelContainer: ModelContainer, unavailable: Bool) {
+        self.modelContainer = modelContainer
+        let context = ModelContext(modelContainer)
+        self.modelExecutor = DefaultSerialModelExecutor(modelContext: context)
+        self.unavailable = unavailable
+    }
+
+    func requireAvailable() throws {
+        if unavailable { throw StoreError.unavailable }
+    }
 
     // MARK: Pointers (durable)
 
@@ -145,24 +166,25 @@ actor CycleStore {
     /// A bucket's full durable state, or nil if it's never run: the high-water mark (or, mid-first-run,
     /// the TOP), plus the FLOOR when a first run is mid-descent. A non-nil floor ⇒ resume that descent
     /// (strictly below the floor) rather than restart. IterativeRun reads this to pick per-bucket mode.
-    func pointerState(_ bucketKey: String) -> (mark: ItemKey, floor: ItemKey?)? {
-        guard let r = row(bucketKey) else { return nil }
+    func pointerState(_ bucketKey: String) throws -> (mark: ItemKey, floor: ItemKey?)? {
+        guard let r = try fetchRow(bucketKey) else { return nil }
         return (r.mark, r.floor)
     }
 
     /// Per-bucket hints handed to connectors for efficient `> mark` listing. A bucket mid-first-run
     /// (floor set) is OMITTED so its connector returns its FULL set — the descent needs items BELOW
     /// its top, which a `> mark` hint would hide. IterativeRun still filters/advances authoritatively.
-    func connectorMarks() -> [String: ItemKey] {
-        let rows = (try? modelContext.fetch(FetchDescriptor<BucketPointer>())) ?? []
-        return Dictionary(rows.filter { $0.floor == nil }.map { ($0.bucketKey, $0.mark) },
+    func connectorMarks() throws -> [String: ItemKey] {
+        try requireAvailable()
+        let rows = try modelContext.fetch(FetchDescriptor<BucketPointer>())
+        return Dictionary(rows.filter { $0.floorOrder == nil }.map { ($0.bucketKey, $0.mark) },
                           uniquingKeysWith: { a, _ in a })
     }
 
     /// Set a bucket's mark directly (used by the Gmail cloud leg, which stamps a run-time pointer and
     /// has no on-device descent). On-device runs use the atomic `advance` / `sinkFloor` instead.
-    func setPointer(_ bucketKey: String, _ mark: ItemKey) {
-        commit(bucketKey: bucketKey, note: nil, apply: { r in
+    func setPointer(_ bucketKey: String, _ mark: ItemKey) throws {
+        try commit(bucketKey: bucketKey, note: nil, apply: { r in
             r.order = mark.order; r.tiebreak = mark.tiebreak; r.updatedAt = Date()
         }, make: {
             BucketPointer(bucketKey: bucketKey, mark: mark)
@@ -170,17 +192,19 @@ actor CycleStore {
     }
 
     /// Initial reset for one bucket: drop its pointer AND its ephemeral notes (fresh top→bottom).
-    func clearBucket(_ bucketKey: String) {
-        if let r = row(bucketKey) { modelContext.delete(r) }
-        try? modelContext.delete(model: CycleNote.self, where: #Predicate { $0.bucketKey == bucketKey })
-        try? modelContext.save()
+    func clearBucket(_ bucketKey: String) throws {
+        try saveChanges {
+            if let r = try fetchRow(bucketKey) { modelContext.delete(r) }
+            try modelContext.delete(model: CycleNote.self, where: #Predicate { $0.bucketKey == bucketKey })
+        }
     }
 
     /// Throwing fetch — lets write paths tell "no row exists" apart from "the fetch failed" (B9). A
     /// swallowed failure here is what let the insert-branch fire on a row that DID exist, colliding on
     /// the @unique key and losing the mark forever.
     private func fetchRow(_ bucketKey: String) throws -> BucketPointer? {
-        try modelContext.fetch(
+        try requireAvailable()
+        return try modelContext.fetch(
             FetchDescriptor<BucketPointer>(predicate: #Predicate { $0.bucketKey == bucketKey })
         ).first
     }
@@ -201,32 +225,42 @@ actor CycleStore {
         }
     }
 
-    /// The collision-safe update-or-insert for a bucket's pointer, committing an optional survivor
-    /// note in the SAME save (the crash-safety atomicity). B9: a fetch or save failure no longer
-    /// swallows the mark — on failure we roll back, then retry as an explicit update of the row that
-    /// actually exists (the unique-collision case), so a bucket can't reprocess forever.
-    private func commit(bucketKey: String, note: NoteDraft?,
-                        apply: (BucketPointer) -> Void, make: () -> BucketPointer) {
-        func attempt() throws {
-            if let note { insertNote(bucketKey: bucketKey, note: note) }
-            if let r = try fetchRow(bucketKey) { apply(r) }
-            else { modelContext.insert(make()) }
+    /// Every write either saves fully or rolls back, including pending in-memory model changes.
+    private func saveChanges(_ change: () throws -> Void) throws {
+        try requireAvailable()
+        try Task.checkCancellation()
+        do {
+            try change()
+            try Task.checkCancellation()
             try modelContext.save()
+        } catch {
+            modelContext.rollback()
+            throw error
+        }
+    }
+
+    /// Note and marker share ONE save. Retry a fetch/save collision once; a terminal failure MUST
+    /// reach the orchestrator so a later item cannot advance its mark past this unsaved survivor.
+    private func commit(bucketKey: String, note: NoteDraft?,
+                        apply: (BucketPointer) -> Void, make: () -> BucketPointer) throws {
+        func attempt() throws {
+            try saveChanges {
+                if let note { try insertNote(bucketKey: bucketKey, note: note) }
+                if let r = try fetchRow(bucketKey) { apply(r) }
+                else { modelContext.insert(make()) }
+            }
         }
         do { try attempt() }
         catch {
+            try Task.checkCancellation()
             Log("CycleStore.commit(\(Self.scheme(bucketKey))) failed: \(ErrorLabel(error)) — rolling back, retrying as update")
             CrashReporting.capture(error)
-            modelContext.rollback()
             do {
-                if let note { insertNote(bucketKey: bucketKey, note: note) }
-                if let r = try fetchRow(bucketKey) { apply(r) }
-                else { modelContext.insert(make()) }   // genuinely no row → last-resort insert
-                try modelContext.save()
+                try attempt()
             } catch {
-                modelContext.rollback()
                 Log("CycleStore.commit(\(Self.scheme(bucketKey))) recovery failed: \(ErrorLabel(error)) — mark NOT persisted this item")
                 CrashReporting.capture(error)
+                throw error
             }
         }
     }
@@ -234,17 +268,31 @@ actor CycleStore {
     // MARK: Notes (ephemeral)
 
     func recordNote(bucketKey: String, kind: SourceKind, sourceID: String, folder: String,
-                    itemDate: Date, text: String, title: String?, reminderFlagged: Bool) {
-        insertNote(bucketKey: bucketKey,
-                   note: NoteDraft(kind: kind, sourceID: sourceID, folder: folder, itemDate: itemDate,
-                                   text: text, title: title, reminderFlagged: reminderFlagged))
-        try? modelContext.save()
+                    itemDate: Date, text: String, title: String?, reminderFlagged: Bool) throws {
+        try saveChanges {
+            try insertNote(bucketKey: bucketKey,
+                           note: NoteDraft(kind: kind, sourceID: sourceID, folder: folder, itemDate: itemDate,
+                                           text: text, title: title, reminderFlagged: reminderFlagged))
+        }
     }
 
-    private func insertNote(bucketKey: String, note: NoteDraft) {
-        modelContext.insert(CycleNote(bucketKey: bucketKey, kind: note.kind, sourceID: note.sourceID,
-                                      folder: note.folder, itemDate: note.itemDate, text: note.text,
-                                      title: note.title, reminderFlagged: note.reminderFlagged))
+    /// Idempotent without a schema migration. The item date distinguishes imported chat windows
+    /// whose source IDs came from an older exporter; existing duplicates of this identity coalesce.
+    private func insertNote(bucketKey: String, note: NoteDraft, createdAt: Date = Date()) throws {
+        let kind = note.kind.rawValue, sourceID = note.sourceID
+        let epoch = note.itemDate.timeIntervalSince1970
+        let existing = try modelContext.fetch(FetchDescriptor<CycleNote>(predicate: #Predicate {
+            $0.bucketKey == bucketKey && $0.kind == kind && $0.sourceID == sourceID && $0.itemDateEpoch == epoch
+        }))
+        if let row = existing.first {
+            row.folder = note.folder; row.text = note.text; row.title = note.title
+            row.reminderFlagged = note.reminderFlagged; row.createdAt = createdAt
+            for duplicate in existing.dropFirst() { modelContext.delete(duplicate) }
+        } else {
+            modelContext.insert(CycleNote(bucketKey: bucketKey, kind: note.kind, sourceID: note.sourceID,
+                                          folder: note.folder, itemDate: note.itemDate, text: note.text,
+                                          title: note.title, reminderFlagged: note.reminderFlagged, createdAt: createdAt))
+        }
     }
 
     // MARK: Atomic per-item commits (the crash-safety core — note + marker in ONE save)
@@ -252,8 +300,8 @@ actor CycleStore {
     /// EVERYDAY (iterative) — record an optional survivor note AND advance the high-water bookmark to
     /// `mark`, in one save. No gap between the two writes ⇒ a crash can never leave a note without its
     /// bookmark (which would re-summarize the item into a duplicate). Clears any floor.
-    func advance(bucketKey: String, note: NoteDraft?, to mark: ItemKey) {
-        commit(bucketKey: bucketKey, note: note, apply: { r in
+    func advance(bucketKey: String, note: NoteDraft?, to mark: ItemKey) throws {
+        try commit(bucketKey: bucketKey, note: note, apply: { r in
             r.order = mark.order; r.tiebreak = mark.tiebreak
             r.floorOrder = nil; r.floorTiebreak = nil; r.updatedAt = Date()
         }, make: {
@@ -264,8 +312,8 @@ actor CycleStore {
     /// FIRST RUN (initial descent) — record an optional survivor note AND sink the floor to `floor`
     /// (top stays fixed), in one save. Creates the row with `top` on the first step. A crash leaves an
     /// honest floor → the next run resumes strictly below it.
-    func sinkFloor(bucketKey: String, note: NoteDraft?, top: ItemKey, floor: ItemKey) {
-        commit(bucketKey: bucketKey, note: note, apply: { r in
+    func sinkFloor(bucketKey: String, note: NoteDraft?, top: ItemKey, floor: ItemKey) throws {
+        try commit(bucketKey: bucketKey, note: note, apply: { r in
             r.order = top.order; r.tiebreak = top.tiebreak
             r.floorOrder = floor.order; r.floorTiebreak = floor.tiebreak; r.updatedAt = Date()
         }, make: {
@@ -275,62 +323,87 @@ actor CycleStore {
 
     /// FIRST RUN done — collapse: clear the floor, leaving `(order, tiebreak)` (the top) as a normal
     /// high-water mark. From here the bucket is in everyday mode. (Mutates an existing row only — no
-    /// insert — so it can't hit the unique-collision path; still capture a swallowed save, since a
-    /// stuck floor would re-run the descent and re-summarize already-done items.)
-    func collapseFloor(_ bucketKey: String) {
-        do {
+    /// insert — so it can't hit the unique-collision path.) Failed saves keep the honest floor.
+    func collapseFloor(_ bucketKey: String) throws {
+        try saveChanges {
             if let r = try fetchRow(bucketKey) { r.floorOrder = nil; r.floorTiebreak = nil; r.updatedAt = Date() }
-            try modelContext.save()
-        } catch {
-            Log("CycleStore.collapseFloor(\(Self.scheme(bucketKey))) failed: \(ErrorLabel(error))")
-            CrashReporting.capture(error)
         }
     }
 
     /// Every current-cycle note, newest first (VIEW SUMMARIES + the cloud corpus).
     func notes() -> [CycleNoteItem] {
-        let rows = (try? modelContext.fetch(FetchDescriptor<CycleNote>(
-            sortBy: [SortDescriptor(\.itemDateEpoch, order: .reverse)]))) ?? []
+        (try? readNotes()) ?? []
+    }
+
+    /// Strict read for operations that depend on having the entire set, such as replacement backup.
+    /// A failed fetch must never be interpreted as "there is nothing to preserve".
+    func readNotes() throws -> [CycleNoteItem] {
+        try requireAvailable()
+        let rows = try modelContext.fetch(FetchDescriptor<CycleNote>(
+            sortBy: [SortDescriptor(\.itemDateEpoch, order: .reverse)]))
         return rows.map(item(from:))
     }
 
     /// End-of-cycle wipe (fired by the proactive button) — pointers persist, notes do not.
     func wipeAllNotes() {
-        try? modelContext.delete(model: CycleNote.self)
-        try? modelContext.save()
+        try? wipeAllNotesDurably()
+    }
+
+    /// Processing callers must observe completion before acknowledging the end of a cycle.
+    func wipeAllNotesDurably() throws {
+        try saveChanges { try modelContext.delete(model: CycleNote.self) }
+    }
+
+    /// Cloud work consumes a snapshot across awaits. A later import can add or revise notes in
+    /// that interval; acknowledge only the exact values the completed work actually consumed.
+    func wipeNotesDurably(matching snapshots: [CycleNoteItem]) throws {
+        let consumed = Dictionary(grouping: snapshots, by: \.id)
+        try saveChanges {
+            for row in try modelContext.fetch(FetchDescriptor<CycleNote>()) {
+                let current = item(from: row)
+                if consumed[current.id]?.contains(current) == true { modelContext.delete(row) }
+            }
+        }
     }
 
     /// Factory reset — delete EVERY pointer and EVERY note (the dev "Reset everything" button pairs
     /// this with wiping the vault). After this, the next run is a fresh first run for every bucket.
     func wipeEverything() {
-        try? modelContext.delete(model: CycleNote.self)
-        try? modelContext.delete(model: BucketPointer.self)
-        try? modelContext.save()
+        try? saveChanges {
+            try modelContext.delete(model: CycleNote.self)
+            try modelContext.delete(model: BucketPointer.self)
+        }
     }
 
-    /// Bulk-insert notes from an export file (dev cross-pollination — share a rich summary set with a
+    /// Merge notes from an export file (dev cross-pollination — share a rich summary set with a
     /// co-founder). Preserves each note's original createdAt + itemDate so proactive's recency windows
     /// stay faithful to the source timeline. `replace` wipes existing notes first. Pointers are NEVER
     /// touched — an import carries summaries only, so the importer's own processing state is unaffected.
-    func importNotes(_ items: [CycleNoteItem], replace: Bool) {
-        if replace { try? modelContext.delete(model: CycleNote.self) }
-        for it in items {
-            modelContext.insert(CycleNote(
-                bucketKey: it.bucketKey, kind: it.kind, sourceID: it.sourceID,
-                folder: it.folder, itemDate: it.itemDate, text: it.text,
-                title: it.title, reminderFlagged: it.reminderFlagged, createdAt: it.createdAt))
+    func importNotes(_ items: [CycleNoteItem], replace: Bool) throws {
+        try saveChanges {
+            if replace { try modelContext.delete(model: CycleNote.self) }
+            for it in items {
+                try insertNote(bucketKey: it.bucketKey,
+                               note: NoteDraft(kind: it.kind, sourceID: it.sourceID, folder: it.folder,
+                                               itemDate: it.itemDate, text: it.text, title: it.title,
+                                               reminderFlagged: it.reminderFlagged), createdAt: it.createdAt)
+            }
         }
-        try? modelContext.save()
     }
 
     /// (notes, distinct buckets) — for the dev UI counts.
     func counts() -> (notes: Int, buckets: Int) {
+        guard !unavailable else { return (0, 0) }
         let n = (try? modelContext.fetch(FetchDescriptor<CycleNote>())) ?? []
         return (n.count, Set(n.map(\.bucketKey)).count)
     }
 
     private func item(from n: CycleNote) -> CycleNoteItem {
-        CycleNoteItem(id: n.sourceID, bucketKey: n.bucketKey,
+        // Length prefixes keep separator characters inside source IDs unambiguous. No stored
+        // column changes; old exports still decode and their obsolete IDs are ignored on import.
+        let identity = [n.bucketKey, n.kind, n.sourceID, String(n.itemDateEpoch.bitPattern)]
+            .map { "\($0.utf8.count):\($0)" }.joined()
+        return CycleNoteItem(id: identity, bucketKey: n.bucketKey,
                       kind: SourceKind(rawValue: n.kind) ?? .file, sourceID: n.sourceID,
                       folder: n.folder, itemDate: Date(timeIntervalSince1970: n.itemDateEpoch),
                       text: n.text, title: n.title, reminderFlagged: n.reminderFlagged, createdAt: n.createdAt)
@@ -341,21 +414,24 @@ actor CycleStore {
 
 extension CycleStore {
     /// The app-wide iterative store, backed by its OWN on-disk store ("IterativeCycle.store" under
-    /// the namespaced `SentientOS` root in Application Support). Wipe-and-retry-once on an
-    /// incompatible schema change (dev convenience).
+    /// the namespaced `SentientOS` root in Application Support). An open failure preserves the DB,
+    /// WAL and SHM for recovery and disables storage; no automatic reset or writable fallback.
     static let shared: CycleStore = {
         let schema = Schema([BucketPointer.self, CycleNote.self])
         let url = URL.sentientSupport.appending(path: "IterativeCycle.store")
         let config = ModelConfiguration(schema: schema, url: url)
-        if let container = try? ModelContainer(for: schema, configurations: config) {
+        do {
+            let container = try ModelContainer(for: schema, configurations: config)
             return CycleStore(modelContainer: container)
+        } catch {
+            Log("CycleStore: open failed (\(String(describing: type(of: error)))); existing storage preserved")
+            // SwiftData still needs a writable scratch backing to construct its in-memory context.
+            // The actor's unavailable guard rejects every operation before it can touch that context.
+            let disabled = ModelConfiguration(schema: schema, isStoredInMemoryOnly: true)
+            guard let container = try? ModelContainer(for: schema, configurations: disabled) else {
+                fatalError("CycleStore: storage unavailable; existing on-disk data was preserved")
+            }
+            return CycleStore(modelContainer: container, unavailable: true)
         }
-        for sfx in ["", "-shm", "-wal"] {
-            try? FileManager.default.removeItem(at: URL(fileURLWithPath: url.path + sfx))
-        }
-        guard let container = try? ModelContainer(for: schema, configurations: config) else {
-            fatalError("CycleStore: could not create its ModelContainer")
-        }
-        return CycleStore(modelContainer: container)
     }()
 }

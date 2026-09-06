@@ -1,0 +1,56 @@
+{
+  "budget" : 1024,
+  "outputs" : [
+    {
+      "bytes" : 329,
+      "context" : "# Synthetic knowledge vault\n\nThis artificial workspace contains Atlas, Mercury, and Lattice demonstration projects. See the project notes for recorded decisions, test results, and personal observations.\n\n- [[Atlas\/Status]]\n- [[Mercury\/Status]]\n- [[Lattice\/Context]]\n\nAtlas\/Status.md\nLattice\/Context.md\nMercury\/Status.md\nREADME.md",
+      "id" : "continuation",
+      "latencyMS" : 4.6106249999999998,
+      "query" : "Atlas session continuation retry recovery next action",
+      "retrievedEvidenceIDs" : [
+
+      ]
+    },
+    {
+      "bytes" : 329,
+      "context" : "# Synthetic knowledge vault\n\nThis artificial workspace contains Atlas, Mercury, and Lattice demonstration projects. See the project notes for recorded decisions, test results, and personal observations.\n\n- [[Atlas\/Status]]\n- [[Mercury\/Status]]\n- [[Lattice\/Context]]\n\nAtlas\/Status.md\nLattice\/Context.md\nMercury\/Status.md\nREADME.md",
+      "id" : "cross-session",
+      "latencyMS" : 0.326459,
+      "query" : "Atlas storage decision SQLite WAL migration",
+      "retrievedEvidenceIDs" : [
+
+      ]
+    },
+    {
+      "bytes" : 329,
+      "context" : "# Synthetic knowledge vault\n\nThis artificial workspace contains Atlas, Mercury, and Lattice demonstration projects. See the project notes for recorded decisions, test results, and personal observations.\n\n- [[Atlas\/Status]]\n- [[Mercury\/Status]]\n- [[Lattice\/Context]]\n\nAtlas\/Status.md\nLattice\/Context.md\nMercury\/Status.md\nREADME.md",
+      "id" : "conflict",
+      "latencyMS" : 0.22741700000000001,
+      "query" : "Atlas launch date correction Friday Monday",
+      "retrievedEvidenceIDs" : [
+
+      ]
+    },
+    {
+      "bytes" : 329,
+      "context" : "# Synthetic knowledge vault\n\nThis artificial workspace contains Atlas, Mercury, and Lattice demonstration projects. See the project notes for recorded decisions, test results, and personal observations.\n\n- [[Atlas\/Status]]\n- [[Mercury\/Status]]\n- [[Lattice\/Context]]\n\nAtlas\/Status.md\nLattice\/Context.md\nMercury\/Status.md\nREADME.md",
+      "id" : "project-isolation",
+      "latencyMS" : 0.19420799999999999,
+      "query" : "Mercury retry recovery status",
+      "retrievedEvidenceIDs" : [
+
+      ]
+    },
+    {
+      "bytes" : 329,
+      "context" : "# Synthetic knowledge vault\n\nThis artificial workspace contains Atlas, Mercury, and Lattice demonstration projects. See the project notes for recorded decisions, test results, and personal observations.\n\n- [[Atlas\/Status]]\n- [[Mercury\/Status]]\n- [[Lattice\/Context]]\n\nAtlas\/Status.md\nLattice\/Context.md\nMercury\/Status.md\nREADME.md",
+      "id" : "lattice",
+      "latencyMS" : 0.204542,
+      "query" : "Workbench validation daily steps sleep",
+      "retrievedEvidenceIDs" : [
+
+      ]
+    }
+  ],
+  "policy" : "Existing get_structure default: README plus tree. No query-aware retrieval exists. A model's subsequent whole-file choices are not evaluated."
+}

@@ -248,6 +248,7 @@ final class OvernightScheduler {
 
             statusLine = "running…"
             await runProcessing(log: log)
+            guard !Task.isCancelled else { break }
             statusLine = "armed (next \(Self.clock(Self.nextOccurrence(minutesSinceMidnight: minutes))))"
         }
     }
@@ -268,9 +269,10 @@ final class OvernightScheduler {
         let runGmail = ModelBackend.connectorsAvailable && ud("dbg.gmail.connected") && ud("dbg.run.gmail")
         let runCalendar = ModelBackend.connectorsAvailable && ud("dbg.calendar.connected") && ud("dbg.run.calendar")
         log.line("FDA=\(fda) · detected: \(sources.isEmpty ? "none" : sources.map(\.label).joined(separator: ", ")) · gmail=\(runGmail) calendar=\(runCalendar)")
-        guard !connectors.isEmpty || runGmail || runCalendar else { log.line("nothing enabled — skipping run."); return }
+        ContextLibrary.shared.refresh()
+        let hasImports = ContextLibrary.shared.sources.contains(where: \.enabled)
+        guard hasImports || !connectors.isEmpty || runGmail || runCalendar else { log.line("nothing enabled — skipping run."); return }
         let modelPath = ModelLocator.resolve()
-        if !connectors.isEmpty && modelPath == nil { log.line("model not found — skipping run."); return }
 
         // B6: go/no-go gate — a lid-shut 3am run holds the Mac fully awake + hammers the GPU, so only
         // when it's safe (on AC, not Low Power, not thermally critical). Skip otherwise; the wake is
@@ -285,8 +287,38 @@ final class OvernightScheduler {
 
         let began = await WakeHelperClient.shared.beginAwake(timeout: 1800)
         log.line("beginAwake (disablesleep 1): \(began ? "OK" : "FAILED")")
-        let heart = Task {
+        let heart = began ? Task {
             while !Task.isCancelled { _ = await WakeHelperClient.shared.heartbeat(); try? await Task.sleep(for: .seconds(60)) }
+        } : nil
+        let succeeded = began && !Task.isCancelled
+            ? await runSteps(connectors: connectors, modelPath: modelPath, runGmail: runGmail, runCalendar: runCalendar, log: log)
+            : false
+
+        // Cleanup is awaited in a fresh task so cancellation of the scheduler cannot suppress it.
+        heart?.cancel()
+        let ended = await Task { await WakeHelperClient.shared.endAwake() }.value
+        log.line("endAwake (disablesleep 0): \(ended ? "OK" : "FAILED")")
+        if succeeded && ended && !Task.isCancelled {
+            log.line("run complete, Mac will sleep.")
+            Analytics.signal("Scheduler.overnightCompleted", tier: .core)
+        } else {
+            log.line("run did not complete; saved work remains available for retry.")
+        }
+    }
+
+    /// Local imports finish first. Their evidence stays outside the legacy cloud summary corpus.
+    /// Every leg must succeed before the destructive end-of-cycle tail is allowed to run.
+    private func runSteps(connectors: [any Connector], modelPath: String?, runGmail: Bool,
+                          runCalendar: Bool, log: SchedulerLog) async -> Bool {
+        guard !Task.isCancelled else { return false }
+        guard await ContextLibrary.shared.importEnabled(), !Task.isCancelled else {
+            log.line("local import incomplete — later processing skipped; inspect Imported Sources for details.")
+            return false
+        }
+        guard !connectors.isEmpty || runGmail || runCalendar else { return true }
+        if !connectors.isEmpty && modelPath == nil {
+            log.line("model not found — local imports saved; device analysis remains pending.")
+            return false
         }
 
         if !connectors.isEmpty, let modelPath {
@@ -296,16 +328,21 @@ final class OvernightScheduler {
                 throttle.maybe { log.line("  … \(pr.done)/\(pr.total)  kept=\(pr.survivors) junk=\(pr.junk) failed=\(pr.failed)") }
             }
             log.line("device DONE: \(p.survivors) kept · \(p.junk) junk · \(p.failed) failed of \(p.total)")
+            guard !Task.isCancelled, !p.cancelled, p.errorMessage == nil, p.failed == 0 else {
+                log.line("device analysis incomplete — cloud steps and summary cleanup skipped.")
+                return false
+            }
         }
-        if runGmail    { await cloudLeg("Gmail",    log: log) { try await GmailConnect.runIterative    { _ in } } }
-        if runCalendar { await cloudLeg("Calendar", log: log) { try await CalendarConnect.runIterative { _ in } } }
+        if runGmail, !(await cloudLeg("Gmail", log: log) { try await GmailConnect.runIterative { _ in } }) { return false }
+        if runCalendar, !(await cloudLeg("Calendar", log: log) { try await CalendarConnect.runIterative { _ in } }) { return false }
+        guard !Task.isCancelled else { return false }
 
         // The shared post-read tail — knowledge base (create/update) → mirror push → proactive
         // (decide → research → prepare) → wipe summaries. This is the EXACT chain the home's Analyze
         // Now runs (ProcessingView → ProactiveCycle), so a scheduled run produces the morning's
         // For-You cards too — there is no scheduler-specific knowledge-base path. Still held awake +
         // heartbeating throughout (proactive uses codex, same as the KB step already does).
-        if let failure = await ProactiveCycle.shared.run(scheduled: true, progress: { phase in
+        if await ProactiveCycle.shared.run(scheduled: true, progress: { phase in
             Task { @MainActor in
                 switch phase {
                 case .knowledgeBase(let s): log.line("proactive: \(s)")
@@ -315,21 +352,27 @@ final class OvernightScheduler {
                 case .failed:               log.line("proactive: FAILED")   // reason withheld — it can embed codex output, and every log line is a Release breadcrumb
                 }
             }
-        }) {
+        }) != nil {
             // Detail withheld (can embed codex output); the morning caution + codex.failure carry the kind.
             log.line("proactive cycle ended with a failure (summaries kept for retry)")
+            return false
         }
-
-        heart.cancel()
-        let ended = await WakeHelperClient.shared.endAwake()
-        log.line("endAwake (disablesleep 0): \(ended ? "OK" : "FAILED") — run complete, Mac will sleep.")
-        Analytics.signal("Scheduler.overnightCompleted", tier: .core)   // always-on usage ping: an overnight run finished cleanly
+        return !Task.isCancelled
     }
 
-    private func cloudLeg(_ name: String, log: SchedulerLog, _ body: () async throws -> Void) async {
+    private func cloudLeg(_ name: String, log: SchedulerLog, _ body: () async throws -> Void) async -> Bool {
+        guard !Task.isCancelled else { return false }
         log.line("\(name) leg…")
-        do { try await body(); log.line("\(name) DONE") }
-        catch { log.line("\(name) FAILED: \(ErrorLabel(error))") }
+        do {
+            try await body()
+            try Task.checkCancellation()
+            log.line("\(name) DONE")
+            return true
+        } catch {
+            log.line("\(name) FAILED: \(ErrorLabel(error))")
+            if !(error is CancellationError), !Task.isCancelled { OvernightCaution.record(await OvernightCaution.classify(error)) }
+            return false
+        }
     }
 
     // MARK: - Time helpers

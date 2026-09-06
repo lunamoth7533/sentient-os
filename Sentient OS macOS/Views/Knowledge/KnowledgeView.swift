@@ -21,9 +21,21 @@ import SwiftUI
 import AppKit
 
 struct KnowledgeView: View {
+    @Environment(\.openWindow) private var openWindow
     /// Scene id for the standalone Knowledge window (opened via `openWindow`). Same string the old
     /// window used, so the app scene + the home's nav item wire up by type name alone.
     static let windowID = "knowledge"
+    private static var primaryRoot: URL { VaultGenerator.vaultRoot }
+    /// An isolated development vault must not show or activate the production cloud mirror.
+    private static var usesProductionVault: Bool {
+        #if DEBUG
+        let environment = ProcessInfo.processInfo.environment
+        if !(environment["SENTIENT_VAULT_ROOT"] ?? "").isEmpty || !(environment["SENTIENT_CONTEXT_ROOT"] ?? "").isEmpty {
+            return false
+        }
+        #endif
+        return true
+    }
 
     @State private var vault: KnowledgeVault?
     @State private var loaded = false
@@ -81,9 +93,14 @@ struct KnowledgeView: View {
             }
         }
         .frame(minWidth: 900, minHeight: 600)
+        .background(ContextCaptureProtection())
         .background(Theme.bg)
         .background(WindowChrome())   // transparent titlebar from launch (no "grey until resize")
         .task { await loadVault() }
+        .onReceive(NotificationCenter.default.publisher(for: Notification.Name("SentientContextChanged"))) { _ in
+            reloadVault()
+            if let selection, !editing { select(selection) }
+        }
         .alert("You have unsaved edits", isPresented: $showDiscardPrompt) {
             Button("Save") { promptSave() }
             Button("Discard", role: .destructive) { promptDiscard() }
@@ -132,11 +149,13 @@ struct KnowledgeView: View {
     }
 
     private func loadVault() async {
+        _ = await ContextLibrary.shared.refreshProjection()
         // A plain directory walk (~a handful of folders) — cheap enough to do inline on open.
-        let v = KnowledgeVault.load()
+        let v = KnowledgeVault.load(root: Self.primaryRoot, additionalRoots: ContextLibrary.shared.projectionReady ? [ContextPaths.projection] : [])
         vault = v
         loaded = true
-        mirrorEnabled = await MirrorClient.shared.isEnabled
+        if Self.usesProductionVault { mirrorEnabled = await MirrorClient.shared.isEnabled }
+        else { mirrorEnabled = false }
         guard selection == nil else { return }
         if let r = v?.readme { open(r) }                          // greet with the portrait
         else if let first = v?.allNotes.first { open(first.url) }
@@ -190,8 +209,12 @@ struct KnowledgeView: View {
 
     /// Read a note + reveal it in the tree (expand its ancestor folders). No history side-effects.
     private func select(_ url: URL) {
+        guard vault?.isReadableNote(url) == true else { selection = nil; note = nil; return }
         selection = url
         note = KnowledgeVault.read(url)
+        if vault?.isReadOnly(url) == true, let current = note {
+            note = (current.title, current.markdown.replacingOccurrences(of: ContextProjection.marker, with: ""))
+        }
         if let v = vault { expanded.formUnion(v.ancestors(of: url)) }
     }
 
@@ -228,12 +251,14 @@ struct KnowledgeView: View {
     /// Enter edit mode over the RAW file (frontmatter + H1 included — we edit the real bytes, never a
     /// reconstruction). Refreshes whether the cloud mirror is on, so Save knows if it should sync.
     private func beginEdit() {
-        guard let url = selection else { return }
+        guard let url = selection, vault?.isReadOnly(url) == false, vault?.isReadableNote(url) == true else { return }
         let raw = (try? String(contentsOf: url, encoding: .utf8)) ?? (note?.markdown ?? "")
         editText = raw; savedText = raw
         editing = true
-        VaultActivity.shared.editorBusy = true
-        Task { mirrorEnabled = await MirrorClient.shared.isEnabled }
+        if Self.usesProductionVault {
+            VaultActivity.shared.editorBusy = true
+            Task { mirrorEnabled = await MirrorClient.shared.isEnabled }
+        }
     }
 
     /// Esc — cancel editing. Dirty → prompt (no parked nav, so Save/Discard just settle in place);
@@ -248,6 +273,7 @@ struct KnowledgeView: View {
     /// → just leave. `completion` continues a parked note-switch from the unsaved-edits prompt.
     private func save(then completion: (() -> Void)? = nil) {
         guard editing, let url = selection else { completion?(); return }
+        guard vault?.isReadOnly(url) == false, vault?.isReadableNote(url) == true else { return }
         guard editText != savedText else { exitEdit(); completion?(); return }
         do {
             try editText.write(to: url, atomically: true, encoding: .utf8)
@@ -258,13 +284,13 @@ struct KnowledgeView: View {
         savedText = editText
         note = KnowledgeVault.read(url)            // refresh the rendered view behind us
         exitEdit()
-        VaultActivity.shared.markChanged()         // schedules the debounced mirror sync
+        markVaultChanged()                        // schedules sync only for the production vault
         completion?()
     }
 
     private func exitEdit() {
         editing = false
-        VaultActivity.shared.editorBusy = false
+        if Self.usesProductionVault { VaultActivity.shared.editorBusy = false }
     }
 
     // The unsaved-edits prompt's three answers.
@@ -285,12 +311,14 @@ struct KnowledgeView: View {
 
     /// Re-scan the vault after a filesystem change. URLs are stable, so `expanded`/`selection` survive
     /// (a now-missing selection is handled by the caller).
-    private func reloadVault() { vault = KnowledgeVault.load() }
+    private func reloadVault() {
+        vault = KnowledgeVault.load(root: Self.primaryRoot, additionalRoots: ContextLibrary.shared.projectionReady ? [ContextPaths.projection] : [])
+    }
 
     /// Move a note OR a folder to the macOS Trash (recoverable). If the open note was the trashed
     /// item — or lived anywhere inside a trashed folder — land back on Overview.
     private func deleteItem(_ url: URL) {
-        guard url != vault?.readme else { return }   // never trash the vault index
+        guard url != vault?.readme, vault?.isReadOnly(url) == false else { return }
         do {
             try FileManager.default.trashItem(at: url, resultingItemURL: nil)
         } catch {
@@ -303,11 +331,12 @@ struct KnowledgeView: View {
             if let r = vault?.readme { open(r) }
             else { selection = nil; note = nil; history = []; historyIndex = -1 }
         }
-        VaultActivity.shared.markChanged()
+        markVaultChanged()
     }
 
     /// Raise the name prompt for a new note/folder inside `parent` (nil = the vault root).
     private func promptCreate(folder: Bool, in parent: URL?) {
+        if let parent, vault?.isReadOnly(parent) != false { return }
         createIsFolder = folder; createParent = parent; createName = ""; showCreatePrompt = true
     }
 
@@ -347,6 +376,7 @@ struct KnowledgeView: View {
 
     private func performCreate() {
         let dir = createParent ?? vault?.root ?? VaultGenerator.vaultRoot
+        guard vault?.isReadOnly(dir) != true else { return }
         if createIsFolder { createFolder(named: createName, in: dir) }
         else { createNote(named: createName, in: dir) }
     }
@@ -364,7 +394,7 @@ struct KnowledgeView: View {
         if let v = vault { expanded.formUnion(v.ancestors(of: url)) }   // reveal its folder chain
         open(url)
         beginEdit()                        // drop straight into typing the body
-        VaultActivity.shared.markChanged()
+        markVaultChanged()
     }
 
     private func createFolder(named raw: String, in dir: URL) {
@@ -378,6 +408,11 @@ struct KnowledgeView: View {
         reloadVault()
         if let v = vault { expanded.formUnion(v.ancestors(of: url)) }   // reveal the parent chain
         expanded.insert(url)                                            // and open the new folder
+        markVaultChanged()
+    }
+
+    private func markVaultChanged() {
+        guard Self.usesProductionVault else { return }
         VaultActivity.shared.markChanged()
     }
 
@@ -445,7 +480,7 @@ struct KnowledgeView: View {
     }
 
     private var countText: String {
-        let n = vault?.titleIndex.count ?? 0
+        let n = vault?.allNotes.count ?? 0
         return "\(n) note\(n == 1 ? "" : "s")"
     }
 
@@ -476,7 +511,10 @@ struct KnowledgeView: View {
     /// is sealed on this Mac before upload; the server only ever stores ciphertext.)
     @ViewBuilder
     private var statusLine: some View {
-        if mirrorEnabled {
+        if let selection, vault?.isReadOnly(selection) == true {
+            Button("Imported evidence · manage source access") { openWindow(id: ContextWorkspaceView.windowID) }
+                .font(.system(size: 11.5)).buttonStyle(.plain)
+        } else if mirrorEnabled {
             switch VaultActivity.shared.syncState {
             case .synced:  cloudStatus("Synced to Cloud MCP", color: Theme.secondary, dot: .white, spinner: false)
             case .pending: cloudStatus("Will sync soon", color: Theme.secondary, dot: .white, spinner: false)
@@ -540,6 +578,7 @@ struct KnowledgeView: View {
                 }
                 ForEach(vault?.nodes ?? []) { node in
                     NodeRow(node: node, depth: 0, expanded: $expanded, selection: selection,
+                            readOnly: vault?.isReadOnly(node.url) == true,
                             onSelect: { requestOpen($0) },
                             onCreate: { promptCreate(folder: $1, in: $0) },
                             onDelete: { deleteItem($0) })
@@ -550,6 +589,7 @@ struct KnowledgeView: View {
             } else {
                 ForEach(searchResults) { node in
                     NoteRow(url: node.url, title: node.name, depth: 0, selected: node.url == selection,
+                            readOnly: vault?.isReadOnly(node.url) == true,
                             onDelete: { deleteItem($0) }) {
                         requestOpen(node.url)
                     }
@@ -598,7 +638,7 @@ struct KnowledgeView: View {
     /// Hidden for the README/Overview — the vault's index shouldn't be one misclick from gone.
     @ViewBuilder
     private var deleteToolbarButton: some View {
-        if let url = selection, url != vault?.readme {
+        if let url = selection, url != vault?.readme, vault?.isReadOnly(url) == false {
             Button(role: .destructive) { deleteItem(url) } label: {
                 Label("Move to Trash", systemImage: "trash")
             }
@@ -627,7 +667,7 @@ struct KnowledgeView: View {
         if editing {
             Button { save() } label: { Label("Save", systemImage: "checkmark") }
                 .labelStyle(.titleAndIcon)
-        } else {
+        } else if let selection, vault?.isReadOnly(selection) == false {
             Button { beginEdit() } label: { Label("Edit", systemImage: "square.and.pencil") }
                 .labelStyle(.titleAndIcon)
                 .help("Edit this note")
@@ -651,8 +691,8 @@ struct KnowledgeView: View {
                             .textSelection(.enabled)
                             .padding(.bottom, 22)
                         MarkdownView(markdown: note.markdown,
-                                     exists: { vault?.resolve($0) != nil },
-                                     onNavigate: { title in if let u = vault?.resolve(title) { requestFollow(u) } },
+                                     exists: { vault?.resolve($0, from: url) != nil },
+                                     onNavigate: { title in if let u = vault?.resolve(title, from: url) { requestFollow(u) } },
                                      onExternal: { NSWorkspace.shared.open($0) })
                     }
                     .frame(maxWidth: 720, alignment: .leading)
@@ -741,6 +781,7 @@ private struct FolderRow: View {
     let name: String
     let depth: Int
     let isOpen: Bool
+    var readOnly = false
     let onCreate: (URL, Bool) -> Void
     let onDelete: (URL) -> Void
     let toggle: () -> Void
@@ -769,7 +810,7 @@ private struct FolderRow: View {
             .buttonStyle(.plain)
 
             // Hover-reveal "+" → create inside THIS folder (zero clutter until the cursor is here).
-            Menu {
+            if !readOnly { Menu {
                 Button { onCreate(url, false) } label: { Label("New Note", systemImage: "doc.badge.plus") }
                 Button { onCreate(url, true) } label: { Label("New Folder", systemImage: "folder.badge.plus") }
             } label: {
@@ -785,16 +826,21 @@ private struct FolderRow: View {
             .opacity(hover ? 1 : 0)
             .padding(.trailing, 6)
             .help("New note or folder in \(name)")
+            }
         }
         .background(rowBackground(selected: false, hover: hover))
         .onHover { hover = $0 }
         .contextMenu {   // create INSIDE this folder
+            if !readOnly {
             Button { onCreate(url, false) } label: { Label("New Note", systemImage: "doc.badge.plus") }
             Button { onCreate(url, true) } label: { Label("New Folder", systemImage: "folder.badge.plus") }
             Divider()
+            }
             Button { NSWorkspace.shared.activateFileViewerSelecting([url]) } label: { Label("Reveal in Finder", systemImage: "folder") }
-            Divider()
-            Button(role: .destructive) { onDelete(url) } label: { Label("Move to Trash", systemImage: "trash") }
+            if !readOnly {
+                Divider()
+                Button(role: .destructive) { onDelete(url) } label: { Label("Move to Trash", systemImage: "trash") }
+            }
         }
     }
 }
@@ -805,6 +851,7 @@ private struct NoteRow: View {
     let title: String
     let depth: Int
     let selected: Bool
+    var readOnly = false
     let onDelete: (URL) -> Void
     let onSelect: () -> Void
     @State private var hover = false
@@ -831,8 +878,10 @@ private struct NoteRow: View {
         .onHover { hover = $0 }
         .contextMenu {
             Button { NSWorkspace.shared.activateFileViewerSelecting([url]) } label: { Label("Reveal in Finder", systemImage: "folder") }
-            Divider()
-            Button(role: .destructive) { onDelete(url) } label: { Label("Move to Trash", systemImage: "trash") }
+            if !readOnly {
+                Divider()
+                Button(role: .destructive) { onDelete(url) } label: { Label("Move to Trash", systemImage: "trash") }
+            }
         }
     }
 }
@@ -844,6 +893,7 @@ private struct NodeRow: View {
     let depth: Int
     @Binding var expanded: Set<URL>
     let selection: URL?
+    var readOnly = false
     let onSelect: (URL) -> Void
     let onCreate: (URL, Bool) -> Void   // (parent folder, isFolder)
     let onDelete: (URL) -> Void
@@ -854,6 +904,7 @@ private struct NodeRow: View {
         if node.isFolder {
             VStack(alignment: .leading, spacing: 1) {
                 FolderRow(url: node.url, name: node.name, depth: depth, isOpen: isOpen,
+                          readOnly: readOnly,
                           onCreate: onCreate, onDelete: onDelete) {
                     withAnimation(.easeInOut(duration: 0.22)) {
                         if isOpen { expanded.remove(node.url) } else { expanded.insert(node.url) }
@@ -867,7 +918,7 @@ private struct NodeRow: View {
                         VStack(alignment: .leading, spacing: 1) {
                             ForEach(node.children) { child in
                                 NodeRow(node: child, depth: depth + 1, expanded: $expanded,
-                                        selection: selection, onSelect: onSelect,
+                                        selection: selection, readOnly: readOnly, onSelect: onSelect,
                                         onCreate: onCreate, onDelete: onDelete)
                             }
                         }
@@ -878,6 +929,7 @@ private struct NodeRow: View {
             }
         } else {
             NoteRow(url: node.url, title: node.name, depth: depth, selected: node.url == selection,
+                    readOnly: readOnly,
                     onDelete: onDelete) {
                 onSelect(node.url)
             }

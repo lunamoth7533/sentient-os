@@ -106,7 +106,7 @@ enum GmailConnect {
     /// re-runs all four after clearBucket), matching the iterative path's all-or-nothing commit.
     @discardableResult
     static func runInitial(onProgress: @Sendable @escaping (Progress) -> Void = { _ in }) async throws -> Int {
-        await CycleStore.shared.clearBucket(bucketKey)
+        try await CycleStore.shared.clearBucket(bucketKey)
         let runStart = Date()
         let cal = Calendar.current
         let today = cal.startOfDay(for: runStart)
@@ -141,7 +141,7 @@ enum GmailConnect {
             for try await done in group {
                 completed += 1
                 if let r = done.result {
-                    await record(r, itemDate: done.window.itemDate, label: done.window.label)
+                    try await record(r, itemDate: done.window.itemDate, label: done.window.label)
                     recorded += 1
                     onProgress(.windowDone(total: initialWeeks, label: done.window.label,
                                            summary: r.summary, threads: r.threadCount,
@@ -156,7 +156,7 @@ enum GmailConnect {
 
         // High-water mark = run start. Iterative reads everything after it (a few hours of overlap
         // is harmless — the cloud updater synthesizes — and beats a boundary gap).
-        await CycleStore.shared.setPointer(bucketKey, ItemKey(order: runStart.timeIntervalSince1970, tiebreak: ""))
+        try await CycleStore.shared.setPointer(bucketKey, ItemKey(order: runStart.timeIntervalSince1970, tiebreak: ""))
         Log("GmailConnect.runInitial: ✅ \(recorded)/\(initialWeeks) weekly summaries recorded (parallel); pointer → \(runStart)")
         return recorded
     }
@@ -167,7 +167,7 @@ enum GmailConnect {
     /// full initial read if Gmail has never been read on this Mac.
     @discardableResult
     static func runIterative(onProgress: @Sendable @escaping (Progress) -> Void = { _ in }) async throws -> Int {
-        guard let mark = await CycleStore.shared.pointer(bucketKey) else {
+        guard let mark = try await CycleStore.shared.pointerState(bucketKey)?.mark else {
             return try await runInitial(onProgress: onProgress)   // never read → fall back to initial
         }
         let since = Date(timeIntervalSince1970: mark.order)
@@ -179,7 +179,7 @@ enum GmailConnect {
         onProgress(.windowStart(total: 1, label: sinceLabel, prompt: prompt))
         var recorded = 0
         if let r = try await read(prompt: prompt) {
-            await record(r, itemDate: runStart, label: sinceLabel)
+            try await record(r, itemDate: runStart, label: sinceLabel)
             recorded = 1
             onProgress(.windowDone(total: 1, label: sinceLabel,
                                    summary: r.summary, threads: r.threadCount, completed: 1, keptSoFar: 1))
@@ -187,7 +187,7 @@ enum GmailConnect {
             onProgress(.windowDone(total: 1, label: sinceLabel,
                                    summary: nil, threads: 0, completed: 1, keptSoFar: 0))
         }
-        await CycleStore.shared.setPointer(bucketKey, ItemKey(order: runStart.timeIntervalSince1970, tiebreak: ""))
+        try await CycleStore.shared.setPointer(bucketKey, ItemKey(order: runStart.timeIntervalSince1970, tiebreak: ""))
         Log("GmailConnect.runIterative: ✅ \(recorded) summary since \(since); pointer → \(runStart)")
         return recorded
     }
@@ -206,9 +206,9 @@ enum GmailConnect {
         return parse(env.result)
     }
 
-    private static func record(_ r: ReadResult, itemDate: Date, label: String) async {
+    private static func record(_ r: ReadResult, itemDate: Date, label: String) async throws {
         let sid = "gmail:\(Int(itemDate.timeIntervalSince1970))"          // unique per window
-        await CycleStore.shared.recordNote(
+        try await CycleStore.shared.recordNote(
             bucketKey: bucketKey, kind: .gmail, sourceID: sid, folder: "Gmail",
             itemDate: itemDate, text: r.summary, title: "Email · \(label)",
             reminderFlagged: r.hasActionItems)

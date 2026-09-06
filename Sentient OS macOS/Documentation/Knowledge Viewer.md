@@ -24,9 +24,14 @@ Tools via `Views/Dev/SummariesView.swift`.)*
 
 **Files (`Views/Knowledge/`):**
 - `VaultTree.swift` — data. Scans the vault into a `VaultNode` tree (folders incl. empty ones,
-  `.md` notes; dotfiles skipped; README pinned out as "Overview"), builds `titleIndex`
-  (lowercased filename stem → URL — the wikilink resolver AND the graph's edge resolver), and
+  `.md` notes; dotfiles and symlinks skipped; README pinned out as "Overview"), builds scoped
+  relative-path and title indexes (ambiguous bare titles remain unresolved), and
   `read()` (strips YAML frontmatter, promotes the first `# H1` to title).
+  `load(root:additionalRoots:)` can mount explicit read-only folders outside the legacy vault;
+  their basename namespaces and graph domains stay separate. `resolve(_:from:)` uses the source
+  note's folder/root, and `isReadOnly(_:)` identifies mounted folders for edit/create/delete guards.
+  Every scan has a fresh `revision`, so the sky refreshes when imported projections arrive or
+  existing note bodies change while the root URL stays the same.
 - `MarkdownView.swift` — rendering. A hand-rolled block renderer for the vault's small verified
   subset — no markdown dependency. `[[wikilinks]]` render as sky-blue links
   (`Theme.knowledgeLink`) over a custom `sentient-wiki:` URL scheme (unresolved → dimmed
@@ -35,7 +40,8 @@ Tools via `Views/Dev/SummariesView.swift`.)*
   reader split view, the editor, create/delete, and the sky↔reader navigation loop.
 - **`Graph/` — the Constellation View** (each file's top comment carries the deep detail):
   - `SkyGraph.swift` — nodes/edges in one pass over the vault: body `[[wikilinks]]` resolved
-    through `titleIndex` (frontmatter is ignored on purpose), domains = top-level folders
+    through the source-aware resolver (frontmatter, code examples, escapes, and HTML comments are
+    ignored), domains = top-level folders and explicit mounted roots
     biggest-first (stable palette assignment), hover-preview lines, and "changed in the last
     36h" flags with a bulk-change guard (a full vault rebuild must not shimmer the whole sky).
     Plus the seeded mock graph the previews render.
@@ -45,7 +51,9 @@ Tools via `Views/Dev/SummariesView.swift`.)*
     BALANCED SET — scale them together or the settled composition changes.
   - `NightSkyModel.swift` — the brain: camera (pan / zoom-at-cursor), hit-testing, hover/focus/
     highlight blends, photon-pulse scheduling, and `load()` — rebuilds match star positions by
-    URL, so re-entering the sky never replays the entrance.
+    URL, so re-entering the sky never replays the entrance. Only the latest noncancelled load
+    may publish; graph-specific hover/pulse indices are cleared and highlights are remapped by
+    note URL after each refresh. A missing real vault clears previously displayed notes.
   - `SkyRenderer.swift` — all Canvas drawing, painter's order: parallax stardust →
     constellation watermarks → the ~11s center breath → threads (resting ones batch into two
     stroked paths; the hovered star's ignite as domain→domain gradients; root-incident threads

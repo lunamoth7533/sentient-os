@@ -14,6 +14,7 @@ import AppKit
 // Entry point is main.swift (the binary doubles as the root wake helper) — so no @main here.
 struct SentientOSApp: App {
     @State private var appState = AppState()
+    @State private var contextMirrorBridge = ContextMirrorBridge()
 
     /// Scene id for the primary home window, so the menu bar's "Open Sentient OS" can reopen/focus it.
     static let homeWindowID = "home"
@@ -33,7 +34,10 @@ struct SentientOSApp: App {
             RootView()
                 .environment(appState)
                 .preferredColorScheme(.dark)   // Sentient OS is dark-only — no light mode
-                .task { await VaultCloud.pushIfDirty() }   // catch up a mirror sync deferred by an earlier quit/failure
+                .task {
+                    await ContextMirrorBridge.refreshRemote()
+                    await VaultCloud.pushIfDirty()
+                }   // also retry an offline removal while sharing is disabled
         }
         .windowStyle(.hiddenTitleBar)            // OLED black runs edge-to-edge; no gray trim
         .windowResizability(.contentMinSize)
@@ -75,6 +79,13 @@ struct SentientOSApp: App {
         }
         .windowResizability(.contentMinSize)
         .defaultSize(width: 1100, height: 720)
+        .restorationBehavior(.disabled)
+
+        // Settings — its own window, opened from the home's top-bar gear. Two-pane layout
+        Window("Imported Context", id: ContextWorkspaceView.windowID) {
+            ContextWorkspaceView().preferredColorScheme(.dark)
+        }
+        .defaultSize(width: 980, height: 780)
         .restorationBehavior(.disabled)
 
         // Settings — its own window, opened from the home's top-bar gear. Two-pane layout

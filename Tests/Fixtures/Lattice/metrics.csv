@@ -1,0 +1,5 @@
+id,metric,value,unit,date,timezone,updated_at,deleted,source
+day-steps,steps,0,steps,2026-09-06,,2026-09-06T12:00:00.125Z,false,"Synthetic, watch"
+day-sleep,sleepHours,,hr,2026-09-06,America/Chicago,2026-09-06T12:00:00Z,false,"Synthetic
+sleep log"
+old-step,steps,,steps,2026-09-05,UTC,2026-09-06T12:30:00Z,true,Synthetic watch

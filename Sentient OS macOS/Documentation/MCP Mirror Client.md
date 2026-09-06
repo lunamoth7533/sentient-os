@@ -15,6 +15,8 @@ await mirror.shareURL                  // the "Copy MCP Link" value, or nil
 try await mirror.push()                // zip + ENCRYPT the vault, replace the mirror (call after any change)
 let s = try await mirror.stats()       // {notesRead24h, toolCalls24h, lastAccess} for "Give AIs Knowledge"
 try await mirror.deleteRemote()        // delete the cloud copy (keeps the password → stable URL)
+try await mirror.contextChanged()      // remove a stale hosted projection after persisted source changes
+MirrorClient.remoteRemovalPending     // deletion/uncertain upload needs acknowledgement or retry
 await mirror.disable()                 // opt out: flip OFF + delete remote, but KEEP the password (stable link)
 let u2 = try await mirror.regenerateToken()  // leak remediation: mint a NEW password, delete old copy, re-push
 MirrorClient.destroyKeychainIdentity() // uninstall only: wipe the Keychain password (+ legacy token)
@@ -46,7 +48,8 @@ password exist". `disable()` flips OFF and deletes the cloud copy but keeps the 
 
 A lost password is a non-event: mint a new one (`regenerateToken`), re-push; the orphaned cloud
 copy expires on its 30-day lease. `regenerateToken` mints + persists the NEW password BEFORE
-deleting the old copy, so a mint/write failure can never strand the user with no cloud copy.
+deleting the old copy, so a mint/write failure preserves the existing identity and hosted copy.
+An old identity awaiting removal stays in a Keychain cleanup queue until deletion succeeds.
 
 ⚠️ **Never mint a weak key.** `mintPassword` throws (rather than returns) if `SecRandomCopyBytes`
 fails — an all-zero buffer would be a predictable identity AND a predictable encryption key.
@@ -74,9 +77,16 @@ server's Python, and both sides derive an identical userID from the same passwor
 
 ## Sync
 
-Whole-vault **encrypted-blob replace**: `push()` zips `VaultGenerator.vaultRoot`, encrypts the zip,
-and `POST`s the ciphertext. A vault is ~KBs of markdown. The zip is built by shelling to
-`/usr/bin/zip` from **inside** the vault dir (`zip -r -X -q … .`) so entries are **root-relative**
+Whole-vault **encrypted-blob replace**: `push()` requires the enabled flag, stages the existing
+`VaultGenerator.vaultRoot` content and fresh `ContextProjection.notes(store:, audience: .shared)`
+under `Imported`, encrypts the zip, and `POST`s the ciphertext. New imported content is never
+persisted into the legacy vault. Staging directories are private (0700; files 0600) and removed
+on success or failure. The archive rejects links, unsupported/unreadable files, changed files,
+path traversal, and collisions with existing legacy notes; it enforces the server's file/size
+limits before uploading. Shared imports can form a mirror even before a legacy vault exists.
+
+The zip is built by shelling to `/usr/bin/zip` from **inside** the disposable staging directory
+(`zip -r -X -q … .`) so entries are **root-relative**
 (`README.md`, `Career/Job.md`) — the server's contract. (We deliberately do *not* use
 `NSFileCoordinator.forUploading`: it wraps everything under the vault folder name, which breaks the
 README-portrait bundling in `get_structure`. The server also defensively unwraps a lone wrapper dir,
@@ -96,6 +106,24 @@ so old clients still sync correctly.)
 success — a failed push stays pending and retries on the next trigger. ⚠️ A non-HTTP response
 (captive portal / transparent proxy) is treated as failure, never success, so a never-synced vault
 is never marked clean.
+
+**Permission changes and deletion ordering.** Imported sharing permissions are read from the
+evidence store for each archive and checked again before and after the upload. If the shared
+projection changes during POST, the client deletes the captured copy before a bounded fresh retry.
+If enable/disable, explicit deletion, or identity rotation invalidates the request, it deletes the
+captured copy and reports failure. All POST/DELETE requests share one queue across actor awaits,
+so a late POST cannot recreate a copy deleted by another operation. Cancellation or a transport
+failure can still mean the server accepted the POST; an uncancelled cleanup request removes it.
+
+`contextChanged()` removes a stale hosted projection promptly after source changes, with the
+normal dirty-vault debounce rebuilding current content. A local-only change with an identical
+shared projection causes no remote request. Removal failures remain pending and keep the required
+identities in the Keychain for restart/retry. `lastPush` is cleared on invalidation; UI must report
+remote removal as pending until acknowledged. Local exclusion is immediate, but offline deletion
+cannot promise a hosted copy or a remote consumer's cached response has already disappeared.
+The disconnect window keeps a pending-removal notice and retry action visible after local opt-out.
+An unreadable credential clears the old success stamp and retains a durable removal request until
+Keychain access returns; it is never interpreted as an already-removed copy.
 
 ## Turning the mirror on (today)
 
@@ -121,20 +149,19 @@ dogfood end-to-end sync on a real INITIAL/ITERATIVE cloud run.
 
 `MirrorClient` is the app's first Keychain user; the small `Keychain` enum at the bottom of the
 file is the shared generic-password helper (service `ai.sentient-os.app`, accessible
-`kSecAttrAccessibleAfterFirstUnlock`). Uninstall is the ONE caller that deletes the password
+`kSecAttrAccessibleAfterFirstUnlock`). Updates use `SecItemUpdate`, preserving the old secret on
+failure. The cleanup queue is stored at `mcp.mirror.pendingDeletions` in the Keychain; no password
+is stored in UserDefaults or logs. Uninstall is the ONE caller that deletes the password
 (`destroyKeychainIdentity`, after `deleteRemote`) — everywhere else it survives by design so the
 pasted share URL outlives resets and off→on.
 
-## Self-test
+## Retained local tests
 
-*(Recreate the harness first — see `Self-Testing (Eval Harness).md`; `Self Tests - Temp/` is kept empty.)*
-
-```sh
-SENTIENT_SELFTEST=mirror "<app>/Contents/MacOS/Sentient OS"          # against production
-SENTIENT_MIRROR_BASE=http://127.0.0.1:8901 SENTIENT_SELFTEST=mirror …  # against a local server
-```
-
-Runs enable → push → stats → delete → disable. Needs a knowledge base on disk (`~/Sentient OS - Knowledge Base/`).
+Run `bash Tests/MirrorReliability/run.sh` from the repository root. The twenty-six behavioral tests
+compile the production client, archive, crypto, evidence store, and shared projection. They use
+only synthetic temporary files/stores, isolated defaults, a fake credential boundary, and an
+in-memory transport. No app launch, real Keychain access, or live mirror request is made. The
+test README records the initial nine behavioral failures and final coverage.
 
 ## The server — the contract this client relies on
 

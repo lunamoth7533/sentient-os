@@ -43,6 +43,7 @@ struct CycleFailure: Sendable, Equatable {
 actor ProactiveCycle {
 
     static let shared = ProactiveCycle()
+    private var running = false
 
     /// When the last full cycle finished (UserDefaults) — drives the Analysis popover's real
     /// "Last run: …" stamp.
@@ -71,9 +72,24 @@ actor ProactiveCycle {
     func run(scheduled: Bool = false,
              progress: @escaping @Sendable (ProactiveCyclePhase) -> Void,
              onLine: (@Sendable (String) -> Void)? = nil) async -> CycleFailure? {
+        guard !Task.isCancelled else { return Self.cancelled(progress: progress) }
+        guard !running else {
+            return Self.localFailure("Another analysis cycle is still finishing. Retry after it completes.", progress: progress)
+        }
+        running = true
+        defer { running = false }
         PipelineActivity.begin()                 // Settings' Reset is disabled while the tail runs
         defer { PipelineActivity.end() }
-        let notes = await CycleStore.shared.notes().map(CloudNote.init)
+        let snapshots: [CycleNoteItem]
+        do {
+            snapshots = try await CycleStore.shared.readNotes()
+            try Task.checkCancellation()
+        } catch {
+            if error is CancellationError || Task.isCancelled { return Self.cancelled(progress: progress) }
+            return Self.localFailure("Local summaries could not be read. Check free disk space and access, then retry. Saved notes were kept.", progress: progress)
+        }
+        let notes = await MainActor.run { snapshots.map(CloudNote.init) }
+        guard !Task.isCancelled else { return Self.cancelled(progress: progress) }
         guard !notes.isEmpty else {                          // nothing new this cycle — harmless no-op
             UserDefaults.standard.set(Date(), forKey: Self.lastCycleKey)
             progress(.done(ready: ProactiveResearch.latest()?.ready.count ?? 0))
@@ -95,6 +111,7 @@ actor ProactiveCycle {
         do {
             if exists { _ = try await VaultCloud.shared.update(notes: notes, onProgress: phase, onLine: onLine) }
             else      { _ = try await VaultCloud.shared.create(notes: notes, onProgress: phase, onLine: onLine) }
+            try Task.checkCancellation()
             Analytics.signal(exists ? "KnowledgeBase.updated" : "KnowledgeBase.built",
                              parameters: ["newSummaries": "\(notes.count)"])
         } catch {
@@ -104,6 +121,7 @@ actor ProactiveCycle {
                                    scheduled: scheduled, progress: progress)
         }
         await VaultCloud.pushIfDirty()                       // no-op if the mirror is off
+        guard !Task.isCancelled else { return Self.cancelled(progress: progress) }
 
         // 2.5) The welcome "gift" — write it ONCE, the first time a knowledge base exists to read.
         //      Best-effort: it's a delight, never load-bearing, so a failure never fails the cycle.
@@ -114,8 +132,10 @@ actor ProactiveCycle {
         if !giftPreexisted {
             progress(.knowledgeBase("Writing your welcome…"))
             do { _ = try await GiftLetter.shared.generate(onLine: onLine) }
+            catch is CancellationError { return Self.cancelled(progress: progress) }
             catch { Log("GiftLetter: welcome skipped — \(ErrorLabel(error))") }   // type only: msg() embeds raw codex output → Sentry breadcrumb
         }
+        guard !Task.isCancelled else { return Self.cancelled(progress: progress) }
 
         // 3) Proactive — decide, then research + prepare. Inject the live calendar when connected.
         //    Knowledge-base-only mode (free/go plan) skips the whole stage: no quota for it, and
@@ -128,6 +148,7 @@ actor ProactiveCycle {
                UserDefaults.standard.bool(forKey: "dbg.calendar.connected") {
                 calCtx = await CalendarConnect.fetchProactiveContext()
             }
+            guard !Task.isCancelled else { return Self.cancelled(progress: progress) }
 
             progress(.deciding)
             let items: [ActionItem]
@@ -139,6 +160,7 @@ actor ProactiveCycle {
                 return await Self.fail("Deciding: \(Self.msg(error))", error: error,
                                        scheduled: scheduled, progress: progress)
             }
+            guard !Task.isCancelled else { return Self.cancelled(progress: progress) }
             Analytics.signal("Proactive.decided", parameters: ["items": "\(items.count)"])
 
             if items.isEmpty {
@@ -147,6 +169,7 @@ actor ProactiveCycle {
                 progress(.researching(items.count))
                 do {
                     let result = try await ProactiveResearch.shared.researchAndPrepare(items: items, notes: notes, calendarContext: calCtx, onLine: onLine)
+                    try Task.checkCancellation()
                     // Core tier; floatValue = the staged-card count, so a dashboard Sum is the
                     // "suggestions Sentient has prepared across the world" total.
                     Analytics.signal("Proactive.prepared", parameters: [
@@ -157,12 +180,21 @@ actor ProactiveCycle {
                                            scheduled: scheduled, progress: progress)
                 }
             }
+            guard !Task.isCancelled else { return Self.cancelled(progress: progress) }
             // The deck was replaced (new cards or a clean empty) — a pre-existing gift's day is done.
             if giftPreexisted { GiftLetter.clear() }
         }
 
-        // 4) Wipe this cycle's summaries — the knowledge base is the durable memory now. Success only.
-        await CycleStore.shared.wipeAllNotes()
+        // Remove only the exact snapshots processed by this cycle. Notes added or corrected while
+        // cloud work was awaiting stay queued, and a failed durable save cannot become success.
+        do {
+            try Task.checkCancellation()
+            try await CycleStore.shared.wipeNotesDurably(matching: snapshots)
+            try Task.checkCancellation()
+        } catch {
+            if error is CancellationError || Task.isCancelled { return Self.cancelled(progress: progress) }
+            return Self.localFailure("The knowledge base was updated, but local summary cleanup could not be saved. Retry after checking disk space and access. Notes remain queued.", progress: progress)
+        }
         OvernightCaution.clear()                             // a full success retires any morning-after banner
         UserDefaults.standard.set(Date(), forKey: Self.lastCycleKey)
         OvernightScheduler.noteFirstCycleCompleted()   // "initial processing ended" → start the 14h auto-enable clock (once)
@@ -172,10 +204,21 @@ actor ProactiveCycle {
 
     private static func msg(_ e: Error) -> String { (e as? LocalizedError)?.errorDescription ?? "\(e)" }
 
+    private static func localFailure(_ message: String, progress: @Sendable (ProactiveCyclePhase) -> Void) -> CycleFailure {
+        let failure = CycleFailure(message: message, kind: nil)
+        progress(.failed(failure))
+        return failure
+    }
+
+    private static func cancelled(progress: @Sendable (ProactiveCyclePhase) -> Void) -> CycleFailure {
+        localFailure("Analysis cancelled. Completed work is saved; retry to finish.", progress: progress)
+    }
+
     /// The one shape every catch site shares: classify the failure, persist the caution on the
     /// unattended run, surface it to the live UI, and hand it back for the caller's return.
     private static func fail(_ message: String, error: Error, scheduled: Bool,
                              progress: @Sendable (ProactiveCyclePhase) -> Void) async -> CycleFailure {
+        if error is CancellationError || Task.isCancelled { return cancelled(progress: progress) }
         let failure = CycleFailure(message: message, kind: await OvernightCaution.classify(error))
         if scheduled { OvernightCaution.record(failure.kind) }   // the morning-after banner
         progress(.failed(failure))
