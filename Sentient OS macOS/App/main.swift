@@ -11,7 +11,11 @@
 import Foundation
 import SwiftUI
 
-if CommandLine.arguments.contains(WakeHelperConfig.helperFlag) {
+if let status = ContextCLI.runIfRequested(CommandLine.arguments) {
+    exit(status)
+} else if CommandLine.arguments.contains("--context-window") {
+    ContextToolsApp.main()
+} else if CommandLine.arguments.contains(WakeHelperConfig.helperFlag) {
     CrashReporting.start(.wakeHelper)   // crash reporting for the root overnight path
     WakeHelper.run()                    // root LaunchDaemon mode — never returns
 } else {

@@ -167,6 +167,7 @@
 			inputFileListPaths = (
 			);
 			inputPaths = (
+				"$(TARGET_BUILD_DIR)/$(FRAMEWORKS_FOLDER_PATH)/libCLiteRTLM_mac.dylib",
 			);
 			name = "Trim app bundle (thin LiteRT-LM, drop docs)";
 			outputFileListPaths = (

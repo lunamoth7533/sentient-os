@@ -1,0 +1,21 @@
+{
+  "schema": "lattice.context-capsule.v1",
+  "id": "synthetic-capsule-1",
+  "generatedAt": "2026-09-06T12:00:00Z",
+  "project": {"id": "synthetic-project", "name": "Synthetic Project", "aliases": []},
+  "provider": "lattice",
+  "goal": "Verify the local connector.",
+  "events": [{
+    "id": "test-1", "projectID": "synthetic-project", "threadID": "thread-1",
+    "occurredAt": "2026-09-06T11:00:00Z", "kind": "test", "status": "succeeded",
+    "source": "Synthetic test runner", "title": "Connector validation",
+    "summary": "Three synthetic checks passed.", "evidence": ["test:synthetic-1"],
+    "metadata": {"passed": "3"}
+  }],
+  "releases": [{
+    "id": "release-1", "projectID": "synthetic-project", "version": "0.1", "build": "1",
+    "commitSHA": "0000000", "occurredAt": "2026-09-06T11:30:00Z", "processingStatus": "complete",
+    "openLoops": ["Run a physical-device check."]
+  }],
+  "redactions": ["Two older work events omitted to satisfy the capsule limit."]
+}

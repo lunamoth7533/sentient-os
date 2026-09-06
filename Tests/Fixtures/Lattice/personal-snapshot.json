@@ -1,0 +1,21 @@
+{
+  "version": 1,
+  "records": {
+    "checkin-2026-09-06": {
+      "id": "checkin-2026-09-06", "day": "2026-09-06",
+      "checkIn": {"day": "2026-09-06", "mood": 4, "caffeineMg": 0},
+      "updatedAt": 810388800.125, "revision": "00000000-0000-4000-8000-000000000001", "deleted": false
+    },
+    "metric-steps-2026-09-06": {
+      "id": "metric-steps-2026-09-06", "day": "2026-09-06", "metric": "steps", "value": 0,
+      "updatedAt": 810388800, "revision": "00000000-0000-4000-8000-000000000002", "deleted": false
+    },
+    "metric-sleepHours-2026-09-05": {
+      "id": "metric-sleepHours-2026-09-05", "day": "2026-09-05", "metric": "sleepHours",
+      "updatedAt": 810388800, "revision": "00000000-0000-4000-8000-000000000003", "deleted": true
+    }
+  },
+  "pending": ["metric-steps-2026-09-06"],
+  "accountID": "synthetic-account-never-import",
+  "changeToken": "c3ludGhldGljLXRva2VuLW5ldmVyLWltcG9ydA=="
+}

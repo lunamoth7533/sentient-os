@@ -13,6 +13,7 @@ import SwiftUI
 import AppKit
 
 struct SourcesPane: View {
+    @Environment(\.openWindow) private var openWindow
     // The shared selection keys (defaults must match SourceSelection).
     @AppStorage("dbg.run.downloads") private var runDownloads = true
     @AppStorage("dbg.run.desktop")   private var runDesktop = true
@@ -58,6 +59,12 @@ struct SourcesPane: View {
                 foldersGroup
                 chatsGroup
                 cloudGroup
+                SettingsGroup(label: "Model sessions & personal exports") {
+                    VStack(alignment: .leading, spacing: 10) {
+                        SettingsProse("Import Codex, Claude Code, Hermes, OpenClaw, Lattice, Markdown or metrics CSV. Inspect evidence locally and choose which sources models may access.")
+                        Button("Manage imported sources…") { openWindow(id: ContextWorkspaceView.windowID) }
+                    }
+                }
             }
         }
         .task { fdaGranted = Permissions.hasFullDiskAccess() }

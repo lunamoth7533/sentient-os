@@ -1,0 +1,6 @@
+{"type":"session","version":3,"id":"claw-one","timestamp":"2026-01-01T10:00:00Z","cwd":"/synthetic/claw"}
+{"type":"model_change","id":"claw-model","parentId":null,"timestamp":"2026-01-01T10:00:01Z","provider":"synthetic-provider","modelId":"synthetic-model"}
+{"type":"message","id":"claw-user","parentId":"claw-model","timestamp":"2026-01-01T10:00:02Z","message":{"role":"user","content":"An artificial request.","timestamp":1767261602000}}
+{"type":"message","id":"claw-call","parentId":"claw-user","timestamp":"2026-01-01T10:00:03Z","message":{"role":"assistant","provider":"synthetic-provider","model":"synthetic-model","content":[{"type":"toolCall","id":"tool-one","name":"read","arguments":{"path":"/synthetic/file"},"input":{"path":"/synthetic/file"}}]}}
+{"type":"message","id":"claw-result","parentId":"claw-call","timestamp":"2026-01-01T10:00:04Z","message":{"role":"toolResult","toolCallId":"tool-one","toolName":"read","isError":false,"content":[{"type":"toolResult","toolCallId":"tool-one","text":"Artificial result.","content":"Artificial result."}]}}
+{"type":"compaction","id":"claw-compact","parentId":"claw-result","timestamp":"2026-01-01T10:00:05Z","summary":"Artificial earlier context.","firstKeptEntryId":"claw-user","tokensBefore":100}

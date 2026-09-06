@@ -823,6 +823,7 @@ actor CodexCLI {
     /// binary's own dir leads PATH (npm shims `#!/usr/bin/env node` right next to themselves).
     private static func richEnvironment(binDir: String) -> [String: String] {
         var env = ProcessInfo.processInfo.environment
+        env["CODEX_INTERNAL_ORIGINATOR_OVERRIDE"] = "sentient"
         let home = env["HOME"] ?? NSHomeDirectory()
         let richPath = [binDir,
                         "\(home)/.local/bin",
@@ -877,6 +878,7 @@ actor CodexCLI {
         // them — without this, the shim exec-fails even when found.
         let binDir = (binary as NSString).deletingLastPathComponent
         var env: [String: String] = [:]
+        env["CODEX_INTERNAL_ORIGINATOR_OVERRIDE"] = "sentient"
         let current = ProcessInfo.processInfo.environment
         for key in ["HOME", "USER"] where current[key] != nil { env[key] = current[key] }
         env["PATH"] = [binDir, "/usr/bin", "/bin", "/usr/sbin", "/sbin"].joined(separator: ":")

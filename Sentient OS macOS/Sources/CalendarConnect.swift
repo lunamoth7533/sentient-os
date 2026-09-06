@@ -93,7 +93,7 @@ enum CalendarConnect {
     /// Records each into CycleStore; sets the high-water mark to the run-start on completion.
     @discardableResult
     static func runInitial(onProgress: @Sendable @escaping (Progress) -> Void = { _ in }) async throws -> Int {
-        await CycleStore.shared.clearBucket(bucketKey)
+        try await CycleStore.shared.clearBucket(bucketKey)
         let runStart = Date()
         let cal = Calendar.current
         let today = cal.startOfDay(for: runStart)
@@ -115,7 +115,7 @@ enum CalendarConnect {
             onProgress(.windowStart(step: month + 1, total: initialMonths, label: monthLabel, prompt: prompt))
             if let r = try await read(prompt: prompt) {
                 let itemDate = upperDay
-                await record(r, itemDate: itemDate, label: monthLabel)
+                try await record(r, itemDate: itemDate, label: monthLabel)
                 recorded += 1
                 onProgress(.windowDone(step: month + 1, total: initialMonths, label: monthLabel,
                                        summary: r.summary, events: r.eventCount, keptSoFar: recorded))
@@ -126,7 +126,7 @@ enum CalendarConnect {
         }
         // High-water mark = run start. Iterative reads everything after it (a little overlap is
         // harmless — the cloud updater synthesizes — and beats a boundary gap).
-        await CycleStore.shared.setPointer(bucketKey, ItemKey(order: runStart.timeIntervalSince1970, tiebreak: ""))
+        try await CycleStore.shared.setPointer(bucketKey, ItemKey(order: runStart.timeIntervalSince1970, tiebreak: ""))
         Log("CalendarConnect.runInitial: ✅ \(recorded)/\(initialMonths) monthly summaries recorded; pointer → \(runStart)")
         return recorded
     }
@@ -137,7 +137,7 @@ enum CalendarConnect {
     /// initial read if Calendar has never been read on this Mac.
     @discardableResult
     static func runIterative(onProgress: @Sendable @escaping (Progress) -> Void = { _ in }) async throws -> Int {
-        guard let mark = await CycleStore.shared.pointer(bucketKey) else {
+        guard let mark = try await CycleStore.shared.pointerState(bucketKey)?.mark else {
             return try await runInitial(onProgress: onProgress)   // never read → fall back to initial
         }
         let since = Date(timeIntervalSince1970: mark.order)
@@ -148,7 +148,7 @@ enum CalendarConnect {
         onProgress(.windowStart(step: 1, total: 1, label: sinceLabel, prompt: prompt))
         var recorded = 0
         if let r = try await read(prompt: prompt) {
-            await record(r, itemDate: runStart, label: sinceLabel)
+            try await record(r, itemDate: runStart, label: sinceLabel)
             recorded = 1
             onProgress(.windowDone(step: 1, total: 1, label: sinceLabel,
                                    summary: r.summary, events: r.eventCount, keptSoFar: 1))
@@ -156,7 +156,7 @@ enum CalendarConnect {
             onProgress(.windowDone(step: 1, total: 1, label: sinceLabel,
                                    summary: nil, events: 0, keptSoFar: 0))
         }
-        await CycleStore.shared.setPointer(bucketKey, ItemKey(order: runStart.timeIntervalSince1970, tiebreak: ""))
+        try await CycleStore.shared.setPointer(bucketKey, ItemKey(order: runStart.timeIntervalSince1970, tiebreak: ""))
         Log("CalendarConnect.runIterative: ✅ \(recorded) summary since \(since); pointer → \(runStart)")
         return recorded
     }
@@ -210,9 +210,9 @@ enum CalendarConnect {
         return parse(env.result)
     }
 
-    private static func record(_ r: ReadResult, itemDate: Date, label: String) async {
+    private static func record(_ r: ReadResult, itemDate: Date, label: String) async throws {
         let sid = "calendar:\(Int(itemDate.timeIntervalSince1970))"        // unique per window
-        await CycleStore.shared.recordNote(
+        try await CycleStore.shared.recordNote(
             bucketKey: bucketKey, kind: .calendar, sourceID: sid, folder: "Calendar",
             itemDate: itemDate, text: r.summary, title: "Calendar · \(label)",
             reminderFlagged: r.hasActionItems)

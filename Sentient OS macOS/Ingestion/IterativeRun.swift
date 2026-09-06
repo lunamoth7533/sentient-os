@@ -28,7 +28,7 @@ private struct ExtractionTimeout: Error { let seconds: Double }
 
 /// The outcome of one item attempt (B10): a survivor draft (or nil), a CONTENT-extraction failure
 /// (the file is bad — engine is fine), or a GENERATE failure (the GPU-wedge path → reload).
-private enum AttemptResult { case ok(NoteDraft?), extractionFailed, generateFailed }
+private enum AttemptResult { case ok(NoteDraft?, Verdict), extractionFailed, generateFailed, triageFailed, cancelled }
 
 /// Holds the racing continuation behind a lock so it resumes exactly once, and so the `@Sendable`
 /// dispatch closures capture this (`@unchecked Sendable`) box instead of the continuation directly.
@@ -77,8 +77,10 @@ struct RunProgress: Sendable {
     var junk = 0
     var sensitive = 0
     var failed = 0
-    var parseFailures = 0          // §7.13: junk that was actually a garbled/unparseable model reply
+    var parseFailures = 0          // garbled/incomplete model replies, deferred for retry
     var extractionFailed = 0       // §7.8/B10: item whose CONTENT extraction failed (corrupt file), not the engine
+    var errorMessage: String?      // actionable failure retained even when other buckets succeed
+    var cancelled = false
     var lastPath: String?
     var lastFilePath: String?      // absolute path (for the thumbnail)
     var lastPrompt: String?        // the EXACT prompt fed to the model for this item (dev prompt pane)
@@ -108,8 +110,34 @@ struct IterativeRun {
              onProgress: @Sendable @escaping (RunProgress) -> Void = { _ in }) async -> RunProgress {
         var p = RunProgress()
         guard !connectors.isEmpty else { return p }
+        guard !Task.isCancelled else { p.cancelled = true; return p }
         PipelineActivity.begin()                 // Settings' Reset is disabled while we're mid-run
         defer { PipelineActivity.end() }
+
+        func reportFailure(_ message: String) {
+            p.failed += 1
+            p.errorMessage = message
+            p.lastVerdict = nil
+            p.lastTitle = nil
+            p.lastSeconds = nil
+            p.lastSummary = message
+            onProgress(p)
+        }
+        func reportStoreFailure(_ error: Error) {
+            reportFailure(error is CycleStore.StoreError ? error.localizedDescription :
+                "Local summary storage could not be read or saved. Check free disk space and access, then retry analysis. Unfinished items remain queued.")
+        }
+
+        // A failed read is not an empty store. Resolve availability and listing hints before loading
+        // the model, so recovery never resets a bucket merely because its pointer was unreadable.
+        let marks: [String: ItemKey]
+        do {
+            try await store.requireAvailable()
+            marks = mode == .initial ? [:] : try await store.connectorMarks()
+        } catch {
+            reportStoreFailure(error)
+            return p
+        }
 
         // §7.22: if this run includes a DB source (WhatsApp/iMessage/Notes need Full Disk Access),
         // report the FDA probe when it isn't cleanly granted — the top "empty morning" signal (a 3am
@@ -128,6 +156,8 @@ struct IterativeRun {
                 tags: ["error": String(describing: type(of: error))],
                 extra: ["model_present": String(ModelLocator.resolve() != nil)],
                 fingerprint: ["engine", "load_failed"])
+            if Task.isCancelled { p.cancelled = true }
+            else { reportFailure("The on-device model could not start. Check the model download and retry analysis. No items were consumed.") }
             return p
         }
 
@@ -157,27 +187,26 @@ struct IterativeRun {
                     try autoreleasepool { try connector.load(cand) }
                 }
             } catch {
-                p.lastSummary = "(extraction skipped: \(error))"
+                if Task.isCancelled { return .cancelled }
                 return .extractionFailed
             }
             do {
+                try Task.checkCancellation()
                 let prompt = Triage.prompt(for: artifact, currentDate: Date())
                 p.lastPrompt = prompt
                 let result = try await engine.generate(prompt: prompt, imageData: artifact.imageData)
+                try Task.checkCancellation()
                 let outcome = Triage.decide(result.text)
+                if outcome.reason == .parseFailed || outcome.reason == .emptySummary {
+                    p.parseFailures += 1
+                    return .triageFailed
+                }
                 var draft: NoteDraft?
                 if outcome.verdict == .survivor {
                     draft = NoteDraft(kind: connector.kind, sourceID: cand.id,
                                       folder: cand.metadata["folder"] ?? "", itemDate: cand.itemDate,
                                       text: outcome.summary, title: outcome.title, reminderFlagged: false)
                 }
-                LifetimeStats.bump(outcome.verdict)
-                switch outcome.verdict {
-                case .survivor:  p.survivors += 1
-                case .junk:      p.junk += 1
-                case .sensitive: p.sensitive += 1
-                }
-                if outcome.reason == .parseFailed { p.parseFailures += 1 }   // §7.13
                 p.lastTitle = outcome.title
                 p.lastSummary = outcome.summary.isEmpty ? nil : outcome.summary
                 p.lastVerdict = outcome.verdict
@@ -186,17 +215,12 @@ struct IterativeRun {
                 #if DEBUG
                 Log("• \(cand.metadata["displayPath"] ?? cand.id) → \(outcome.verdict)")
                 #endif
-                return .ok(draft)
+                return .ok(draft, outcome.verdict)
             } catch {
-                p.lastSummary = "(generate skipped: \(error))"
+                if Task.isCancelled { return .cancelled }
                 return .generateFailed
             }
         }
-
-        // Explicit INITIAL reprocesses from scratch → pass [:]. Otherwise pass the per-bucket marks as
-        // a connector query hint (connectorMarks omits mid-first-run buckets so their connector returns
-        // the FULL set — the descent needs items below the top); the run still filters authoritatively.
-        let marks = mode == .initial ? [:] : await store.connectorMarks()
 
         runLoop: for connector in connectors {
             if Task.isCancelled { break }
@@ -209,6 +233,8 @@ struct IterativeRun {
                 CrashReporting.captureEvent("source.dropped", level: .error,
                     tags: ["source": connector.kind.rawValue, "error": String(describing: type(of: error))],
                     fingerprint: ["source", "dropped", connector.kind.rawValue])
+                if Task.isCancelled { break }
+                reportFailure("A source could not be read. Check its access permissions and retry analysis; its saved progress was preserved.")
                 continue
             }
 
@@ -221,7 +247,9 @@ struct IterativeRun {
             bucketLoop: for bucket in buckets {
                 if Task.isCancelled { break runLoop }
 
-                var state = await store.pointerState(bucket.key)
+                var state: (mark: ItemKey, floor: ItemKey?)?
+                do { state = try await store.pointerState(bucket.key) }
+                catch { reportStoreFailure(error); continue }
 
                 // Per-bucket effective mode. .auto: no state → fresh first run; floor still set → a
                 // first run was interrupted, RESUME it; collapsed (floor nil) → everyday catch-up.
@@ -239,7 +267,13 @@ struct IterativeRun {
                 case .initial:
                     // Explicit INITIAL = full reset (re-summarize everything). An .auto-chosen initial
                     // (fresh first run OR resuming an interrupted one) keeps its partial progress.
-                    if mode == .initial { await store.clearBucket(bucket.key); state = nil }
+                    if mode == .initial {
+                        do { try await store.clearBucket(bucket.key); state = nil }
+                        catch {
+                            if Task.isCancelled { break runLoop }
+                            reportStoreFailure(error); continue bucketLoop
+                        }
+                    }
                     let resumeFloor = state?.floor
                     let descentTop: ItemKey
                     if let m = state?.mark, resumeFloor != nil {
@@ -277,6 +311,7 @@ struct IterativeRun {
                             tags: ["source": connector.kind.rawValue],
                             extra: ["processed": String(processedThisConnector),
                                     "cap_seconds": String(Int(Self.sourceTimeCapSeconds))])
+                        reportFailure("A source reached the analysis time limit. Its remaining items will resume on the next analysis.")
                         finished = false
                         break bucketLoop
                     }
@@ -286,6 +321,7 @@ struct IterativeRun {
                     p.lastFilePath = w.item.metadata["path"]
 
                     var result = await attempt(w.item, connector: connector)
+                    if Task.isCancelled { finished = false; break runLoop }
                     // B10: only a GENERATE failure implicates the engine → the GPU-wedge reload path.
                     // An extraction failure means the file is bad; the engine is fine — never reload for it.
                     if case .generateFailed = result {
@@ -301,12 +337,14 @@ struct IterativeRun {
                                             "consecutive_failures": String(consecutiveFailures),
                                             "processed": String(processedThisConnector)],
                                     fingerprint: ["engine", "hard_stop"])
+                                reportFailure("The on-device engine could not recover. Retry analysis; unfinished items remain queued.")
                                 finished = false; break runLoop
                             }
                             await reloadEngine(reason: "reactive"); reloadsWithoutProgress += 1; consecutiveFailures = 0
                             result = await attempt(w.item, connector: connector)   // retry once on a fresh engine
                         }
                     }
+                    if Task.isCancelled { finished = false; break runLoop }
                     // §7.8/B10: for FILE items, extraction succeeded unless it was the extraction that
                     // failed (a generate failure still means the content extracted fine). Feeds the
                     // rolling extraction-rate sensor.
@@ -315,18 +353,43 @@ struct IterativeRun {
                         else { SourceHealth.recordExtraction(succeeded: true) }
                     }
                     let draft: NoteDraft?
+                    let verdict: Verdict
                     switch result {
-                    case .ok(let d):        consecutiveFailures = 0; reloadsWithoutProgress = 0; draft = d
-                    case .extractionFailed: p.failed += 1; p.extractionFailed += 1; draft = nil   // no reload
-                    case .generateFailed:   p.failed += 1; draft = nil
+                    case .ok(let d, let v): draft = d; verdict = v
+                    case .extractionFailed:
+                        p.extractionFailed += 1
+                        reportFailure("An item could not be read. Its folder or conversation will resume from that item on the next analysis.")
+                        continue bucketLoop
+                    case .generateFailed:
+                        reportFailure("The on-device model could not summarize an item. Its folder or conversation will retry from that item on the next analysis.")
+                        continue bucketLoop
+                    case .triageFailed:
+                        reportFailure("An item produced an unreadable summary. Its folder or conversation will retry from that item on the next analysis.")
+                        continue bucketLoop
+                    case .cancelled:
+                        finished = false; break runLoop
                     }
 
                     // ONE atomic store write per item: optional survivor note + marker advance — no gap
                     // for a crash to land in. Iterative climbs the mark; initial sinks the floor.
-                    switch effective {
-                    case .iterative: await store.advance(bucketKey: bucket.key, note: draft, to: w.key)
-                    case .initial:   await store.sinkFloor(bucketKey: bucket.key, note: draft, top: top!, floor: w.key)
-                    case .auto:      break
+                    do {
+                        try Task.checkCancellation()
+                        switch effective {
+                        case .iterative: try await store.advance(bucketKey: bucket.key, note: draft, to: w.key)
+                        case .initial:   try await store.sinkFloor(bucketKey: bucket.key, note: draft, top: top!, floor: w.key)
+                        case .auto:      break
+                        }
+                    } catch {
+                        if Task.isCancelled { finished = false; break runLoop }
+                        reportStoreFailure(error)
+                        continue bucketLoop
+                    }
+                    consecutiveFailures = 0; reloadsWithoutProgress = 0
+                    LifetimeStats.bump(verdict)
+                    switch verdict {
+                    case .survivor: p.survivors += 1
+                    case .junk: p.junk += 1
+                    case .sensitive: p.sensitive += 1
                     }
                     sinceReload += 1; p.done += 1; processedThisConnector += 1
                     onProgress(p)
@@ -334,11 +397,20 @@ struct IterativeRun {
 
                 // First run reached the bottom → collapse the floor into the normal high-water mark.
                 if effective == .initial, finished, top != nil {
-                    await store.collapseFloor(bucket.key)
+                    do { try await store.collapseFloor(bucket.key) }
+                    catch {
+                        if Task.isCancelled { break runLoop }
+                        reportStoreFailure(error)
+                    }
                 }
             }
         }
         await engine.unload()
+        if Task.isCancelled {
+            p.cancelled = true
+            p.lastVerdict = nil
+            onProgress(p)
+        }
 
         // §7.13: with a real sample, a high share of junk that was actually GARBLED model output
         // (not genuine junk) is the "why so much junk?" tripwire — a decode/prompt/format regression.

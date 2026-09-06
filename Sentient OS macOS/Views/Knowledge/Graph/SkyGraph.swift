@@ -4,7 +4,7 @@
 //
 //  Data for the Knowledge window's Night Sky (the graph view): every vault note becomes a star,
 //  every resolved [[wikilink]] a thread. One pass over the on-disk vault reads each body once,
-//  extracting links (resolved through KnowledgeVault.titleIndex), a clean hover-card preview
+//  extracting links (resolved by source folder and explicit vault path), a clean hover-card preview
 //  line, and a "changed last night" flag. Top-level folders become constellations (domains),
 //  ordered biggest-first for palette assignment; the root README is the sun.
 //
@@ -48,15 +48,14 @@ struct SkyGraph {
     // MARK: Build from the real vault
 
     static func build(from vault: KnowledgeVault) -> SkyGraph {
-        let notes = vault.allNotes                       // includes the README
-        let rootPath = vault.root.standardizedFileURL.path
+        let notes = vault.allNotes.filter { vault.isReadableNote($0.url) } // includes the README
 
         // Constellations = top-level folders, biggest first (ties alphabetical, so palette
         // assignment is stable run to run).
         var noteDomainNames: [String?] = []
         var domainCounts: [String: Int] = [:]
         for n in notes {
-            let d = (n.url == vault.readme) ? nil : topFolder(of: n.url, rootPath: rootPath)
+            let d = (n.url == vault.readme) ? nil : vault.domainName(of: n.url)
             noteDomainNames.append(d)
             if let d { domainCounts[d, default: 0] += 1 }
         }
@@ -73,11 +72,8 @@ struct SkyGraph {
         for (i, n) in notes.enumerated() {
             let body = KnowledgeVault.read(n.url).markdown
             previews[i] = previewLine(from: body)
-            for m in body.matches(of: #/\[\[([^\]]+)\]\]/#) {
-                var target = String(m.output.1)
-                if let bar = target.firstIndex(of: "|") { target = String(target[..<bar]) }    // [[X|alias]]
-                if let hash = target.firstIndex(of: "#") { target = String(target[..<hash]) }  // [[X#heading]]
-                guard let dest = vault.resolve(target), let j = urlIndex[dest], j != i else { continue }
+            for target in wikilinks(in: body) {
+                guard let dest = vault.resolve(target, from: n.url), let j = urlIndex[dest], j != i else { continue }
                 pairs.insert(EdgePair(a: min(i, j), b: max(i, j)))
             }
             if let mtime = try? n.url.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate {
@@ -107,13 +103,62 @@ struct SkyGraph {
         return finish(nodes: nodes, pairs: pairs, domains: domains)
     }
 
-    /// The first path component under the vault root, if the note lives inside a folder.
-    private static func topFolder(of url: URL, rootPath: String) -> String? {
-        let p = url.standardizedFileURL.path
-        guard p.hasPrefix(rootPath) else { return nil }
-        let rel = p.dropFirst(rootPath.count).trimmingCharacters(in: CharacterSet(charactersIn: "/"))
-        let comps = rel.components(separatedBy: "/")
-        return comps.count >= 2 ? comps.first : nil
+    /// Only actual wikilink syntax creates edges. Fenced/indented code and inline code spans are
+    /// examples, not relationships; odd preceding backslash counts escape a link delimiter.
+    private static func wikilinks(in body: String) -> [String] {
+        // Keep an unmatchable boundary when hiding examples, so removing markup cannot join two
+        // pieces of text into a new link target that never appeared in the source.
+        let body = body.replacing(#/<!--[\s\S]*?(?:-->|$)/#) { _ in "\0" }
+        var prose: [String] = []
+        var fence: (character: Character, count: Int)?
+        for line in body.components(separatedBy: "\n") {
+            let trimmed = line.trimmingCharacters(in: .whitespaces)
+            let indentation = line.prefix(while: { $0 == " " }).count
+            if let first = trimmed.first, first == "`" || first == "~", indentation <= 3 {
+                let count = trimmed.prefix(while: { $0 == first }).count
+                if let open = fence {
+                    if first == open.character && count >= open.count && trimmed.dropFirst(count).trimmingCharacters(in: .whitespaces).isEmpty {
+                        fence = nil
+                    }
+                    continue
+                } else if count >= 3 {
+                    fence = (first, count)
+                    continue
+                }
+            }
+            guard fence == nil, indentation < 4, !line.hasPrefix("\t") else { continue }
+            prose.append(line)
+        }
+        let characters = Array(prose.joined(separator: "\n"))
+        var visible = "", position = 0
+        while position < characters.count {
+            guard characters[position] == "`" else {
+                visible.append(characters[position]); position += 1; continue
+            }
+            var end = position
+            while end < characters.count && characters[end] == "`" { end += 1 }
+            let length = end - position
+            var scan = end, closing: Int?
+            while scan < characters.count {
+                if characters[scan] != "`" { scan += 1; continue }
+                var runEnd = scan
+                while runEnd < characters.count && characters[runEnd] == "`" { runEnd += 1 }
+                if runEnd - scan == length { closing = runEnd; break }
+                scan = runEnd
+            }
+            if let closing { visible.append("\0"); position = closing }
+            else { visible.append(contentsOf: characters[position..<end]); position = end }
+        }
+        return visible.matches(of: #/\[\[([^\]\r\n]+)\]\]/#).compactMap { match in
+            guard !match.output.1.contains("\0") else { return nil }
+            var index = match.range.lowerBound, escapes = 0
+            while index > visible.startIndex {
+                let previous = visible.index(before: index)
+                guard visible[previous] == "\\" else { break }
+                escapes += 1; index = previous
+            }
+            return escapes.isMultiple(of: 2) ? String(match.output.1) : nil
+        }
     }
 
     /// First readable line of a body, cleaned into plain prose for the hover card.

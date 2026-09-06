@@ -65,6 +65,15 @@ final class NightSkyModel: ObservableObject {
 
     private var lastTick: TimeInterval?
     private var dragging = false
+    private var loadGeneration: UInt64 = 0
+    private var preservesPreviewWithoutVault = false
+    private let buildGraph: (KnowledgeVault) async -> SkyGraph
+
+    init(buildGraph: @escaping (KnowledgeVault) async -> SkyGraph = { vault in
+        await Task.detached(priority: .userInitiated) { SkyGraph.build(from: vault) }.value
+    }) {
+        self.buildGraph = buildGraph
+    }
 
     // MARK: Loading
 
@@ -72,10 +81,24 @@ final class NightSkyModel: ObservableObject {
     /// re-entries keep every star exactly where the user left it.
     @MainActor
     func load(vault: KnowledgeVault?) async {
-        // No vault → keep whatever sky exists (a fresh model shows the empty state anyway; the
-        // preview factory's mock galaxy must survive the view's load-on-appear task).
-        guard let vault else { return }
-        let g = await Task.detached(priority: .userInitiated) { SkyGraph.build(from: vault) }.value
+        guard !Task.isCancelled else { return }
+        loadGeneration &+= 1
+        let generation = loadGeneration
+        guard let vault else {
+            if !preservesPreviewWithoutVault {
+                graph = nil
+                sim = nil
+                glow = []
+                clearGraphInteractions()
+                pendingHighlightURL = nil
+            }
+            return
+        }
+        let g = await buildGraph(vault)
+        // A cancelled SwiftUI task's detached build may finish later, as may an older scan.
+        // Only the current request may publish graph indices or replace the simulation.
+        guard !Task.isCancelled, generation == loadGeneration else { return }
+        let highlightURL = pendingHighlightURL ?? highlightIndex.flatMap { nodeURL($0) }
         if let old = graph, let oldSim = sim {
             let positions = Dictionary(uniqueKeysWithValues: zip(old.nodes.map(\.url), oldSim.pos))
             let s = SkySimulation(graph: g, entrance: true)
@@ -87,8 +110,21 @@ final class NightSkyModel: ObservableObject {
         }
         graph = g
         glow = [Double](repeating: 0, count: g.nodes.count)
-        clearFocus()
+        clearGraphInteractions()
+        pendingHighlightURL = highlightURL
         resolvePendingHighlight()
+    }
+
+    /// Indices belong to one graph revision. Keep camera/positions, but never reuse old edge or
+    /// focus indices after additions/removals reorder nodes; highlights are remapped by URL.
+    private func clearGraphInteractions() {
+        clearFocus()
+        highlightIndex = nil
+        highlightBlend = 0
+        pulses = []
+        nextPulseAt = .infinity
+        dragging = false
+        lastTick = nil
     }
 
     // MARK: The frame tick (called from the Canvas closure — main thread, no published writes)
@@ -275,6 +311,7 @@ final class NightSkyModel: ObservableObject {
 
     static func preview(hovering: Int? = nil) -> NightSkyModel {
         let m = NightSkyModel()
+        m.preservesPreviewWithoutVault = true
         let g = SkyGraph.mock()
         m.graph = g
         m.sim = SkySimulation(graph: g, entrance: false)
