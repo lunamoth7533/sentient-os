@@ -1,6 +1,7 @@
 # Importing Lattice context and personal metrics
 
 All examples and test fixtures in this repository are synthetic. Add a file source explicitly in Sentient; no adapter discovers Lattice's live store, requests HealthKit access, or connects to an account. External sharing starts off. Every personal snapshot and metrics CSV record, including deletion markers, is marked sensitive in the evidence inspector. Source inclusion and sharing permissions govern its use.
+
 ## Supported Lattice Workbench export
 
 In Lattice, open **Work**, choose one **Project Lens**, then choose **Approved Agent Context → Export JSON capsule**. Save the exported JSON and select it as a **Lattice export** source in Sentient. Lattice's **Share Markdown context** action can instead be used with Sentient's Markdown import. Workbench context contains development summaries and evidence handles; it is not a health-data export.
